@@ -22,6 +22,11 @@ verify Stark signatures or the computed commitment root, submit the root
 transaction to C1, or forward datasets to C2. It must not be used as a
 successful Paradex ingress until those steps are implemented.
 
+`delivery.js` reconstructs v2 records from Mongo, checks chunk and manifest
+digests, and calls only C2's dataset import/update RPCs in manifest order. It
+does not submit the signed root transaction to C2. Delivery scheduling,
+retry state, and the C1 block replay barrier remain to be connected.
+
 The `Build image` GitHub Actions workflow publishes a versioned GHCR image
 manually. The image is linked to this public repository so Kubernetes can pull
 it anonymously.

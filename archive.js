@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { constants, zstdCompressSync } from 'node:zlib';
+import { constants, zstdCompressSync, zstdDecompressSync } from 'node:zlib';
 import { MongoClient } from 'mongodb';
 
 const prime = (1n << 251n) + (17n << 192n) + 1n;
@@ -156,5 +156,50 @@ export class MongoArchive {
       throw new Error('Conflicting transaction admission');
     }
     return id;
+  }
+
+  async loadDataset(id) {
+    const document = await this.manifests.findOne({ _id: id });
+    if (!document) throw new Error('Missing recovery manifest');
+    const payload = Buffer.from(document.payload.buffer);
+    if (hash(payload) !== id || payload.length > 65536) throw new Error('Corrupt recovery manifest');
+    const manifest = JSON.parse(payload.toString('utf8'));
+    if (manifest.version !== recoveryVersion || manifest.chain_id !== this.chainId ||
+        !Number.isInteger(manifest.entries) || manifest.entries < 0 ||
+        manifest.entries > maxEntries ||
+        !Array.isArray(manifest.chunks) ||
+        manifest.chunks.length !== Math.ceil(manifest.entries / chunkEntries)) {
+      throw new Error('Invalid recovery manifest');
+    }
+    const entries = [];
+    for (const chunkId of manifest.chunks) {
+      const item = await this.chunks.findOne({ _id: chunkId });
+      if (!item) throw new Error('Missing recovery chunk');
+      const compressed = Buffer.from(item.payload.buffer);
+      if (hash(compressed) !== chunkId || compressed.length > chunkEntries * 64 + 1024) {
+        throw new Error('Corrupt recovery chunk');
+      }
+      const raw = zstdDecompressSync(compressed, { maxOutputLength: chunkEntries * 64 + 1 });
+      if (raw.length === 0 || raw.length > chunkEntries * 64 || raw.length % 64 !== 0) {
+        throw new Error('Invalid recovery chunk length');
+      }
+      for (let i = 0; i < raw.length; i += 64) {
+        const key = felt(`0x${raw.subarray(i, i + 32).toString('hex')}`);
+        const value = felt(`0x${raw.subarray(i + 32, i + 64).toString('hex')}`);
+        if (entries.length && BigInt(entries.at(-1)[0]) >= BigInt(key)) {
+          throw new Error('Unsorted recovery keys');
+        }
+        entries.push([key, value]);
+      }
+    }
+    if (entries.length !== manifest.entries) throw new Error('Recovery entry count mismatch');
+    const ref = await this.refs.findOne({ _id: referenceKey(manifest.update, manifest.root) });
+    if (ref?.manifest_id !== id) throw new Error('Missing recovery reference');
+    return {
+      update: manifest.update,
+      root: manifest.root,
+      entries,
+      signatures: ref.signatures,
+    };
   }
 }
