@@ -29,8 +29,14 @@ test('accepted method shape fails closed without claiming import', async () => {
 });
 
 test('Mongo archive finishes before the unavailable response', async () => {
-  let stored = false;
-  const listener = createServer({ ready: async () => {}, store: async () => { stored = true; } });
+  let staged = false;
+  const listener = createServer({ ready: async () => {},
+    store: async () => ['manifest-id'],
+    stageAdmission: async (tx, ids) => {
+      assert.equal(tx.type, 'INVOKE');
+      assert.deepEqual(ids, ['manifest-id']);
+      staged = true;
+    } });
   await new Promise(resolve => listener.listen(0, '127.0.0.1', resolve));
   try {
     const response = await fetch(`http://127.0.0.1:${listener.address().port}`, {
@@ -39,7 +45,7 @@ test('Mongo archive finishes before the unavailable response', async () => {
         method: 'madara_V0_1_0_importCommittedDataAndSubmitTransaction',
         params: [[{ root: '0x1', entries: [['0x0', '0x2']] }], { type: 'INVOKE' }] }),
     });
-    assert.equal(stored, true);
+    assert.equal(staged, true);
     assert.equal((await response.json()).error.code, -32003);
   } finally {
     listener.close();

@@ -12,6 +12,9 @@ Madara PR #1361 recovery-v2 content-addressed chunks and manifests to the same
 collection indexes namespace/root to manifest ID and retains import signatures.
 Writes use majority reads and journaled majority writes, with the manifest
 published only after every chunk is stored. Retried imports are idempotent.
+An additional proxy admission collection records the signed transaction and
+ordered manifest IDs before any future C1 submission. It is keyed by the
+transaction payload digest so a retry cannot silently change its datasets.
 
 This stage still returns the unavailable error after storage. It does not yet
 verify Stark signatures or the computed commitment root, submit the root

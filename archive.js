@@ -90,6 +90,7 @@ export class MongoArchive {
     this.manifests = db.collection(`${collectionPrefix}_committed_manifests_v${recoveryVersion}`, options);
     this.chunks = db.collection(`${collectionPrefix}_committed_chunks_v${recoveryVersion}`, options);
     this.refs = db.collection(`${collectionPrefix}_committed_proxy_refs_v${recoveryVersion}`, options);
+    this.admissions = db.collection(`${collectionPrefix}_committed_proxy_admissions_v${recoveryVersion}`, options);
   }
 
   static async connect(uri, database, chainId) {
@@ -128,5 +129,27 @@ export class MongoArchive {
       ids.push(record.id);
     }
     return ids;
+  }
+
+  async stageAdmission(transaction, datasets) {
+    const serialized = Buffer.from(JSON.stringify(transaction));
+    if (serialized.length > 1024 * 1024) throw new Error('Transaction too large');
+    const id = hash(serialized);
+    const document = {
+      _id: id,
+      chain_id: this.chainId,
+      dataset_ids: datasets,
+      transaction: serialized,
+      status: 'archived',
+    };
+    await this.admissions.updateOne({ _id: id },
+      { $setOnInsert: document }, { upsert: true });
+    const saved = await this.admissions.findOne({ _id: id });
+    if (!saved || saved.chain_id !== document.chain_id ||
+        JSON.stringify(saved.dataset_ids) !== JSON.stringify(datasets) ||
+        !Buffer.from(saved.transaction.buffer).equals(serialized)) {
+      throw new Error('Conflicting transaction admission');
+    }
+    return id;
   }
 }

@@ -48,7 +48,8 @@ export function createServer(archive = null) {
       }
       if (archive) {
         try {
-          await archive.store(call.params[0]);
+          const ids = await archive.store(call.params[0]);
+          await archive.stageAdmission(call.params[1], ids);
         } catch (error) {
           console.error('Committed data archive failed:', error.message);
           return reply(res, 200, { jsonrpc: '2.0', id,
