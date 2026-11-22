@@ -7,8 +7,8 @@ storage and transaction routing are implemented. It never acknowledges an
 import it has not stored.
 
 With `MONGO_URI`, `MONGO_DATABASE`, and `CHAIN_ID` set, the proxy writes
-Madara recovery-v1 content-addressed chunks and manifests to the same
-`transactions_committed_*_v1` collection layout. A separate proxy reference
+Madara PR #1361 recovery-v2 content-addressed chunks and manifests to the same
+`transactions_committed_*_v2` collection layout. A separate proxy reference
 collection indexes namespace/root to manifest ID and retains import signatures.
 Writes use majority reads and journaled majority writes, with the manifest
 published only after every chunk is stored. Retried imports are idempotent.

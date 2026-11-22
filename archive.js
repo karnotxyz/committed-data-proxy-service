@@ -6,6 +6,7 @@ const prime = (1n << 251n) + (17n << 192n) + 1n;
 const maxEntries = 524288;
 const chunkEntries = 8192;
 const collectionPrefix = 'transactions';
+const recoveryVersion = 2;
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 
 function felt(input) {
@@ -38,8 +39,8 @@ function referenceKey(update, root) {
 export function encodeRecoveryRecord(chainId, dataset, base = null) {
   const root = felt(dataset.root);
   const update = normalizeUpdate(dataset.update);
-  if (!Array.isArray(dataset.entries) || dataset.entries.length < 1 ||
-      dataset.entries.length > maxEntries) throw new Error('Invalid entry count');
+  if (!Array.isArray(dataset.entries) || dataset.entries.length > maxEntries ||
+      (dataset.entries.length === 0 && root !== '0x0')) throw new Error('Invalid entry count');
   if (Boolean(update?.base_root) !== Boolean(base)) throw new Error('Missing recovery base');
   const entries = dataset.entries.map(pair => {
     if (!Array.isArray(pair) || pair.length !== 2) throw new Error('Invalid entry');
@@ -57,7 +58,7 @@ export function encodeRecoveryRecord(chainId, dataset, base = null) {
     }));
   }
   const manifest = {
-    version: 1,
+    version: recoveryVersion,
     chain_id: felt(chainId),
     update,
     root,
@@ -86,9 +87,9 @@ export class MongoArchive {
     const options = { readConcern: { level: 'majority' },
       writeConcern: { w: 'majority', j: true } };
     const db = client.db(database);
-    this.manifests = db.collection(`${collectionPrefix}_committed_manifests_v1`, options);
-    this.chunks = db.collection(`${collectionPrefix}_committed_chunks_v1`, options);
-    this.refs = db.collection(`${collectionPrefix}_committed_proxy_refs_v1`, options);
+    this.manifests = db.collection(`${collectionPrefix}_committed_manifests_v${recoveryVersion}`, options);
+    this.chunks = db.collection(`${collectionPrefix}_committed_chunks_v${recoveryVersion}`, options);
+    this.refs = db.collection(`${collectionPrefix}_committed_proxy_refs_v${recoveryVersion}`, options);
   }
 
   static async connect(uri, database, chainId) {
