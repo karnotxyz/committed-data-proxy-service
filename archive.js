@@ -93,6 +93,7 @@ export class MongoArchive {
     this.chunks = db.collection(`${collectionPrefix}_committed_chunks_v${recoveryVersion}`, options);
     this.refs = db.collection(`${collectionPrefix}_committed_proxy_refs_v${recoveryVersion}`, options);
     this.admissions = db.collection(`${collectionPrefix}_committed_proxy_admissions_v${recoveryVersion}`, options);
+    this.smoke = db.collection(`${collectionPrefix}_committed_proxy_smoke`, options);
   }
 
   static async connect(uri, database, chainId, collectionPrefix = defaultCollectionPrefix) {
@@ -159,6 +160,42 @@ export class MongoArchive {
       throw new Error('Conflicting transaction admission');
     }
     return id;
+  }
+
+  async smokeWrite() {
+    const id = randomUUID();
+    await this.smoke.createIndex({ created_at: 1 }, { expireAfterSeconds: 86400 });
+    await this.smoke.insertOne({ _id: id, created_at: new Date(), value: randomUUID() });
+    if (!await this.smoke.findOne({ _id: id })) throw new Error('Mongo smoke readback failed');
+    return id;
+  }
+
+  async markC2Delivered(id) {
+    const result = await this.admissions.updateOne({ _id: id },
+      { $set: { c2_status: 'delivered', delivered_at: new Date() } });
+    if (result.matchedCount !== 1) throw new Error('Missing admission');
+  }
+
+  async claimSubmission(id) {
+    const claimed = await this.admissions.findOneAndUpdate(
+      { _id: id, status: 'archived' },
+      { $set: { status: 'submitting', submission_started_at: new Date() } },
+      { returnDocument: 'after' });
+    if (claimed) return { claimed: true };
+    const existing = await this.admissions.findOne({ _id: id });
+    if (!existing) throw new Error('Missing admission');
+    return { claimed: false, status: existing.status, transaction_hash: existing.tx_hash };
+  }
+
+  async finishSubmission(id, transactionHash) {
+    const result = await this.admissions.updateOne({ _id: id, status: 'submitting' },
+      { $set: { status: 'submitted', tx_hash: felt(transactionHash), submitted_at: new Date() } });
+    if (result.matchedCount !== 1) throw new Error('Submission state changed');
+  }
+
+  async markSubmissionUnknown(id, error) {
+    await this.admissions.updateOne({ _id: id, status: 'submitting' },
+      { $set: { status: 'uncertain', submission_error: String(error).slice(0, 256) } });
   }
 
   async loadDataset(id) {
