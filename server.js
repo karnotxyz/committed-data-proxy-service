@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { MongoArchive } from './archive.js';
 
 const method = 'madara_V0_1_0_importCommittedDataAndSubmitTransaction';
 const maxBytes = 128 * 1024 * 1024;
@@ -8,10 +9,18 @@ function reply(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-export function createServer() {
+export function createServer(archive = null) {
   return http.createServer(async (req, res) => {
-    if (req.method === 'GET' && (req.url === '/health' || req.url === '/ready')) {
+    if (req.method === 'GET' && req.url === '/health') {
       return reply(res, 200, { status: 'ok' });
+    }
+    if (req.method === 'GET' && req.url === '/ready') {
+      try {
+        if (archive) await archive.ready();
+        return reply(res, 200, { status: 'ok' });
+      } catch {
+        return reply(res, 503, { status: 'unavailable' });
+      }
     }
     if (req.method !== 'POST' || req.url !== '/') {
       return reply(res, 404, { error: 'not found' });
@@ -37,6 +46,15 @@ export function createServer() {
         return reply(res, 200, { jsonrpc: '2.0', id,
           error: { code: -32602, message: 'Invalid params or method' } });
       }
+      if (archive) {
+        try {
+          await archive.store(call.params[0]);
+        } catch (error) {
+          console.error('Committed data archive failed:', error.message);
+          return reply(res, 200, { jsonrpc: '2.0', id,
+            error: { code: -32004, message: 'Committed data could not be stored' } });
+        }
+      }
       return reply(res, 200, { jsonrpc: '2.0', id,
         error: { code: -32003, message: 'Committed data import is not enabled' } });
     } catch {
@@ -48,7 +66,11 @@ export function createServer() {
 
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
   const port = Number(process.env.PORT || 9945);
-  createServer().listen(port, '0.0.0.0', () => {
-    console.log(`committed-data proxy listening on ${port}; imports disabled`);
+  const archive = process.env.MONGO_URI
+    ? await MongoArchive.connect(process.env.MONGO_URI,
+      process.env.MONGO_DATABASE || 'committed_data', process.env.CHAIN_ID)
+    : null;
+  createServer(archive).listen(port, '0.0.0.0', () => {
+    console.log(`committed-data proxy listening on ${port}; transaction forwarding disabled`);
   });
 }
