@@ -69,7 +69,8 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
   const port = Number(process.env.PORT || 9945);
   const archive = process.env.MONGO_URI
     ? await MongoArchive.connect(process.env.MONGO_URI,
-      process.env.MONGO_DATABASE || 'committed_data', process.env.CHAIN_ID)
+      process.env.MONGO_DATABASE || 'madara', process.env.CHAIN_ID,
+      process.env.MONGO_COLLECTION_PREFIX || 'mempool_transactions')
     : null;
   createServer(archive).listen(port, '0.0.0.0', () => {
     console.log(`committed-data proxy listening on ${port}; transaction forwarding disabled`);

@@ -6,9 +6,10 @@ an explicit `-32003` unavailable error for import requests until durable
 storage and transaction routing are implemented. It never acknowledges an
 import it has not stored.
 
-With `MONGO_URI`, `MONGO_DATABASE`, and `CHAIN_ID` set, the proxy writes
+With `MONGO_URI` and `CHAIN_ID` set, the proxy writes
 Madara PR #1361 recovery-v2 content-addressed chunks and manifests to the same
-`transactions_committed_*_v2` collection layout. A separate proxy reference
+`mempool_transactions_committed_*_v2` collection layout (database `madara`
+by default). A separate proxy reference
 collection indexes namespace/root to manifest ID and retains import signatures.
 Writes use majority reads and journaled majority writes, with the manifest
 published only after every chunk is stored. Retried imports are idempotent.

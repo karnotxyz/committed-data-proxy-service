@@ -5,7 +5,7 @@ import { MongoClient } from 'mongodb';
 const prime = (1n << 251n) + (17n << 192n) + 1n;
 const maxEntries = 524288;
 const chunkEntries = 8192;
-const collectionPrefix = 'transactions';
+const defaultCollectionPrefix = 'mempool_transactions';
 const recoveryVersion = 2;
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 
@@ -81,7 +81,7 @@ async function immutable(collection, id, payload) {
 }
 
 export class MongoArchive {
-  constructor(client, database, chainId) {
+  constructor(client, database, chainId, collectionPrefix = defaultCollectionPrefix) {
     this.client = client;
     this.chainId = felt(chainId);
     const options = { readConcern: { level: 'majority' },
@@ -93,11 +93,11 @@ export class MongoArchive {
     this.admissions = db.collection(`${collectionPrefix}_committed_proxy_admissions_v${recoveryVersion}`, options);
   }
 
-  static async connect(uri, database, chainId) {
+  static async connect(uri, database, chainId, collectionPrefix = defaultCollectionPrefix) {
     const client = new MongoClient(uri, { serverSelectionTimeoutMS: 5000 });
     await client.connect();
     await client.db(database).command({ ping: 1 });
-    return new MongoArchive(client, database, chainId);
+    return new MongoArchive(client, database, chainId, collectionPrefix);
   }
 
   async ready() {
