@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { MongoArchive } from './archive.js';
+import { startDeliveryWorker } from './delivery.js';
 
 const method = 'madara_V0_1_0_importCommittedDataAndSubmitTransaction';
 const maxBytes = 128 * 1024 * 1024;
@@ -72,6 +73,9 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
       process.env.MONGO_DATABASE || 'madara', process.env.CHAIN_ID,
       process.env.MONGO_COLLECTION_PREFIX || 'mempool_transactions')
     : null;
+  if (archive && process.env.C2_IMPORT_URL) {
+    startDeliveryWorker(archive, process.env.C2_IMPORT_URL);
+  }
   createServer(archive).listen(port, '0.0.0.0', () => {
     console.log(`committed-data proxy listening on ${port}; transaction forwarding disabled`);
   });

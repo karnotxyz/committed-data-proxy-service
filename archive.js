@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants, zstdCompressSync, zstdDecompressSync } from 'node:zlib';
 import { MongoClient } from 'mongodb';
 
@@ -146,6 +146,9 @@ export class MongoArchive {
       dataset_ids: datasets,
       transaction: serialized,
       status: 'archived',
+      c2_status: 'pending',
+      next_attempt_at: new Date(0),
+      created_at: new Date(),
     };
     await this.admissions.updateOne({ _id: id },
       { $setOnInsert: document }, { upsert: true });
@@ -201,5 +204,32 @@ export class MongoArchive {
       entries,
       signatures: ref.signatures,
     };
+  }
+
+  async claimDelivery(now = new Date()) {
+    const token = randomUUID();
+    const leaseUntil = new Date(now.getTime() + 30 * 60 * 1000);
+    const claim = await this.admissions.findOneAndUpdate({
+      $or: [
+        { c2_status: 'pending', next_attempt_at: { $lte: now } },
+        { c2_status: 'sending', lease_until: { $lte: now } },
+      ],
+    }, {
+      $set: { c2_status: 'sending', lease_until: leaseUntil, lease_token: token },
+      $inc: { attempts: 1 },
+    }, { sort: { created_at: 1 }, returnDocument: 'after' });
+    return claim ? { ...claim, lease_token: token } : null;
+  }
+
+  async finishDelivery(id, token, error = null, attempts = 1) {
+    const backoffMs = Math.min(30000 * 2 ** Math.min(attempts - 1, 6), 30 * 60 * 1000);
+    const update = error
+      ? { c2_status: 'pending', next_attempt_at: new Date(Date.now() + backoffMs),
+        last_error: String(error).slice(0, 256) }
+      : { c2_status: 'delivered', delivered_at: new Date() };
+    const result = await this.admissions.updateOne(
+      { _id: id, c2_status: 'sending', lease_token: token },
+      { $set: update, $unset: { lease_until: '', lease_token: '' } });
+    if (result.matchedCount !== 1) throw new Error('Delivery lease lost');
   }
 }

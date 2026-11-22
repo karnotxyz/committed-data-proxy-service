@@ -27,3 +27,32 @@ export async function deliverDatasets(archive, ids, c2Url, fetchImpl = fetch) {
     await importDataset(c2Url, await archive.loadDataset(id), fetchImpl);
   }
 }
+
+export async function deliverOnePending(archive, c2Url, fetchImpl = fetch) {
+  const admission = await archive.claimDelivery();
+  if (!admission) return false;
+  try {
+    await deliverDatasets(archive, admission.dataset_ids, c2Url, fetchImpl);
+    await archive.finishDelivery(admission._id, admission.lease_token);
+  } catch (error) {
+    await archive.finishDelivery(admission._id, admission.lease_token, error.message, admission.attempts);
+    throw error;
+  }
+  return true;
+}
+
+export function startDeliveryWorker(archive, c2Url) {
+  let running = false;
+  const timer = setInterval(async () => {
+    if (running) return;
+    running = true;
+    try {
+      await deliverOnePending(archive, c2Url);
+    } catch (error) {
+      console.error('C2 delivery failed:', error.message);
+    } finally {
+      running = false;
+    }
+  }, 2000);
+  return () => clearInterval(timer);
+}

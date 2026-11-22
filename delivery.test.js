@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { deliverDatasets } from './delivery.js';
+import { deliverDatasets, deliverOnePending } from './delivery.js';
 
 test('C2 receives only ordered dataset import RPCs', async () => {
   const sent = [];
@@ -20,4 +20,17 @@ test('C2 receives only ordered dataset import RPCs', async () => {
   assert.equal(sent[0].params.length, 3);
   assert.equal(sent[1].params.length, 4);
   assert.equal(sent.some(call => call.method.includes('SubmitTransaction')), false);
+});
+
+test('delivery marks admission after all dataset imports', async () => {
+  const calls = [];
+  const archive = {
+    claimDelivery: async () => ({ _id: 'admission', lease_token: 'lease', dataset_ids: ['one'] }),
+    loadDataset: async () => ({ root: '0x1', entries: [], signatures: [] }),
+    finishDelivery: async (...args) => calls.push(args),
+  };
+  await deliverOnePending(archive, 'http://c2', async () => ({
+    ok: true, json: async () => ({ jsonrpc: '2.0', result: null }),
+  }));
+  assert.deepEqual(calls, [['admission', 'lease']]);
 });

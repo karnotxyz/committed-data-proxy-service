@@ -24,8 +24,10 @@ successful Paradex ingress until those steps are implemented.
 
 `delivery.js` reconstructs v2 records from Mongo, checks chunk and manifest
 digests, and calls only C2's dataset import/update RPCs in manifest order. It
-does not submit the signed root transaction to C2. Delivery scheduling,
-retry state, and the C1 block replay barrier remain to be connected.
+does not submit the signed root transaction to C2. When `C2_IMPORT_URL` is
+configured, the proxy claims pending admission records with a Mongo lease,
+retries failed imports, and marks them delivered only after every dataset RPC
+returns successfully. The C1 block replay barrier remains to be connected.
 
 The `Build image` GitHub Actions workflow publishes a versioned GHCR image
 manually. The image is linked to this public repository so Kubernetes can pull
