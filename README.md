@@ -29,6 +29,11 @@ configured, the proxy claims pending admission records with a Mongo lease,
 retries failed imports, and marks them delivered only after every dataset RPC
 returns successfully. The C1 block replay barrier remains to be connected.
 
+`c1.js` prepares the standard `starknet_addInvokeTransaction` call for the
+existing Mainnet sequencer and returns its transaction hash. It is deliberately
+not wired into the listener yet: signer/root validation and a durable
+submission retry policy must be completed before enabling Mainnet forwarding.
+
 The `Build image` GitHub Actions workflow publishes a versioned GHCR image
 manually. The image is linked to this public repository so Kubernetes can pull
 it anonymously.

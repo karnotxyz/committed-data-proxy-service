@@ -3,7 +3,7 @@ LABEL org.opencontainers.image.source="https://github.com/karnotxyz/committed-da
 WORKDIR /app
 COPY --chown=node:node package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
-COPY --chown=node:node server.js archive.js delivery.js ./
+COPY --chown=node:node server.js archive.js delivery.js c1.js ./
 USER node
 EXPOSE 9945
 CMD ["node", "server.js"]
