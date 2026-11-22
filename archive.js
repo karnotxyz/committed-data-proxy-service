@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
-import { constants, zstdCompressSync } from 'node:zlib';
+import { createHash, randomUUID } from 'node:crypto';
+import { constants, zstdCompressSync, zstdDecompressSync } from 'node:zlib';
 import { MongoClient } from 'mongodb';
 
 const prime = (1n << 251n) + (17n << 192n) + 1n;
@@ -93,6 +93,7 @@ export class MongoArchive {
     this.chunks = db.collection(`${collectionPrefix}_committed_chunks_v${recoveryVersion}`, options);
     this.refs = db.collection(`${collectionPrefix}_committed_proxy_refs_v${recoveryVersion}`, options);
     this.admissions = db.collection(`${collectionPrefix}_committed_proxy_admissions_v${recoveryVersion}`, options);
+    this.smoke = db.collection(`${collectionPrefix}_committed_proxy_smoke`, options);
   }
 
   static async connect(uri, database, chainId, collectionPrefix = defaultCollectionPrefix) {
@@ -146,6 +147,9 @@ export class MongoArchive {
       dataset_ids: datasets,
       transaction: serialized,
       status: 'archived',
+      c2_status: 'pending',
+      next_attempt_at: new Date(0),
+      created_at: new Date(),
     };
     await this.admissions.updateOne({ _id: id },
       { $setOnInsert: document }, { upsert: true });
@@ -156,5 +160,113 @@ export class MongoArchive {
       throw new Error('Conflicting transaction admission');
     }
     return id;
+  }
+
+  async smokeWrite() {
+    const id = randomUUID();
+    await this.smoke.createIndex({ created_at: 1 }, { expireAfterSeconds: 86400 });
+    await this.smoke.insertOne({ _id: id, created_at: new Date(), value: randomUUID() });
+    if (!await this.smoke.findOne({ _id: id })) throw new Error('Mongo smoke readback failed');
+    return id;
+  }
+
+  async markC2Delivered(id) {
+    const result = await this.admissions.updateOne({ _id: id },
+      { $set: { c2_status: 'delivered', delivered_at: new Date() } });
+    if (result.matchedCount !== 1) throw new Error('Missing admission');
+  }
+
+  async claimSubmission(id) {
+    const claimed = await this.admissions.findOneAndUpdate(
+      { _id: id, status: 'archived' },
+      { $set: { status: 'submitting', submission_started_at: new Date() } },
+      { returnDocument: 'after' });
+    if (claimed) return { claimed: true };
+    const existing = await this.admissions.findOne({ _id: id });
+    if (!existing) throw new Error('Missing admission');
+    return { claimed: false, status: existing.status, transaction_hash: existing.tx_hash };
+  }
+
+  async finishSubmission(id, transactionHash) {
+    const result = await this.admissions.updateOne({ _id: id, status: 'submitting' },
+      { $set: { status: 'submitted', tx_hash: felt(transactionHash), submitted_at: new Date() } });
+    if (result.matchedCount !== 1) throw new Error('Submission state changed');
+  }
+
+  async markSubmissionUnknown(id, error) {
+    await this.admissions.updateOne({ _id: id, status: 'submitting' },
+      { $set: { status: 'uncertain', submission_error: String(error).slice(0, 256) } });
+  }
+
+  async loadDataset(id) {
+    const document = await this.manifests.findOne({ _id: id });
+    if (!document) throw new Error('Missing recovery manifest');
+    const payload = Buffer.from(document.payload.buffer);
+    if (hash(payload) !== id || payload.length > 65536) throw new Error('Corrupt recovery manifest');
+    const manifest = JSON.parse(payload.toString('utf8'));
+    if (manifest.version !== recoveryVersion || manifest.chain_id !== this.chainId ||
+        !Number.isInteger(manifest.entries) || manifest.entries < 0 ||
+        manifest.entries > maxEntries ||
+        !Array.isArray(manifest.chunks) ||
+        manifest.chunks.length !== Math.ceil(manifest.entries / chunkEntries)) {
+      throw new Error('Invalid recovery manifest');
+    }
+    const entries = [];
+    for (const chunkId of manifest.chunks) {
+      const item = await this.chunks.findOne({ _id: chunkId });
+      if (!item) throw new Error('Missing recovery chunk');
+      const compressed = Buffer.from(item.payload.buffer);
+      if (hash(compressed) !== chunkId || compressed.length > chunkEntries * 64 + 1024) {
+        throw new Error('Corrupt recovery chunk');
+      }
+      const raw = zstdDecompressSync(compressed, { maxOutputLength: chunkEntries * 64 + 1 });
+      if (raw.length === 0 || raw.length > chunkEntries * 64 || raw.length % 64 !== 0) {
+        throw new Error('Invalid recovery chunk length');
+      }
+      for (let i = 0; i < raw.length; i += 64) {
+        const key = felt(`0x${raw.subarray(i, i + 32).toString('hex')}`);
+        const value = felt(`0x${raw.subarray(i + 32, i + 64).toString('hex')}`);
+        if (entries.length && BigInt(entries.at(-1)[0]) >= BigInt(key)) {
+          throw new Error('Unsorted recovery keys');
+        }
+        entries.push([key, value]);
+      }
+    }
+    if (entries.length !== manifest.entries) throw new Error('Recovery entry count mismatch');
+    const ref = await this.refs.findOne({ _id: referenceKey(manifest.update, manifest.root) });
+    if (ref?.manifest_id !== id) throw new Error('Missing recovery reference');
+    return {
+      update: manifest.update,
+      root: manifest.root,
+      entries,
+      signatures: ref.signatures,
+    };
+  }
+
+  async claimDelivery(now = new Date()) {
+    const token = randomUUID();
+    const leaseUntil = new Date(now.getTime() + 30 * 60 * 1000);
+    const claim = await this.admissions.findOneAndUpdate({
+      $or: [
+        { c2_status: 'pending', next_attempt_at: { $lte: now } },
+        { c2_status: 'sending', lease_until: { $lte: now } },
+      ],
+    }, {
+      $set: { c2_status: 'sending', lease_until: leaseUntil, lease_token: token },
+      $inc: { attempts: 1 },
+    }, { sort: { created_at: 1 }, returnDocument: 'after' });
+    return claim ? { ...claim, lease_token: token } : null;
+  }
+
+  async finishDelivery(id, token, error = null, attempts = 1) {
+    const backoffMs = Math.min(30000 * 2 ** Math.min(attempts - 1, 6), 30 * 60 * 1000);
+    const update = error
+      ? { c2_status: 'pending', next_attempt_at: new Date(Date.now() + backoffMs),
+        last_error: String(error).slice(0, 256) }
+      : { c2_status: 'delivered', delivered_at: new Date() };
+    const result = await this.admissions.updateOne(
+      { _id: id, c2_status: 'sending', lease_token: token },
+      { $set: update, $unset: { lease_until: '', lease_token: '' } });
+    if (result.matchedCount !== 1) throw new Error('Delivery lease lost');
   }
 }
