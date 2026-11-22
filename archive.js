@@ -44,7 +44,9 @@ export function encodeRecoveryRecord(chainId, dataset, base = null) {
   if (Boolean(update?.base_root) !== Boolean(base)) throw new Error('Missing recovery base');
   const entries = dataset.entries.map(pair => {
     if (!Array.isArray(pair) || pair.length !== 2) throw new Error('Invalid entry');
-    return [felt(pair[0]), felt(pair[1])];
+    const key = felt(pair[0]);
+    if (BigInt(key) >= (1n << 251n)) throw new Error('Patricia key out of range');
+    return [key, felt(pair[1])];
   }).sort((a, b) => BigInt(a[0]) < BigInt(b[0]) ? -1 : BigInt(a[0]) > BigInt(b[0]) ? 1 : 0);
   for (let i = 1; i < entries.length; i++) {
     if (entries[i - 1][0] === entries[i][0]) throw new Error('Duplicate key');
@@ -107,6 +109,9 @@ export class MongoArchive {
   async store(datasets) {
     const ids = [];
     for (const dataset of datasets) {
+      if (!Array.isArray(dataset.signatures ?? []) || dataset.signatures?.length > 32) {
+        throw new Error('Invalid signature count');
+      }
       const update = normalizeUpdate(dataset.update);
       const root = felt(dataset.root);
       let base = null;

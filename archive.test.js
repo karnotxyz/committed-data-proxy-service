@@ -29,6 +29,9 @@ test('duplicate keys and missing base are rejected', () => {
     root: '0x2', entries: [['0x1', '0x3']],
     update: { application_id: '0x5', dataset_id: '0x6', base_root: '0x7' },
   }), /Missing recovery base/);
+  assert.throws(() => encodeRecoveryRecord('0x1', {
+    root: '0x2', entries: [[`0x${(1n << 251n).toString(16)}`, '0x3']],
+  }), /Patricia key out of range/);
 });
 
 test('empty Patricia root is a valid version 2 record', () => {
