@@ -14,6 +14,34 @@ test('health and readiness', async () => {
   for (const path of ['/health', '/ready']) {
     const response = await fetch(url + path);
     assert.equal(response.status, 200);
+    assert.equal(await response.text(), 'OK');
+  }
+});
+
+test('Madara named params reach the archive; unknown methods have a distinct RPC error', async () => {
+  let stored = false;
+  const listener = createServer({ ready: async () => {},
+    store: async datasets => { stored = datasets.length === 1; return ['manifest']; },
+    stageAdmission: async () => 'admission' });
+  await new Promise(resolve => listener.listen(0, '127.0.0.1', resolve));
+  try {
+    const rpc = async (method, params) => {
+      const response = await fetch(`http://127.0.0.1:${listener.address().port}/`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 22, method, params }),
+      });
+      return response.json();
+    };
+    const method = 'madara_V0_1_0_importCommittedDataAndSubmitTransaction';
+    const named = await rpc(method, { datasets: [{ root: '0x0', entries: [] }],
+      transaction: { type: 'INVOKE' } });
+    assert.equal(named.error.code, -32003);
+    assert.equal(stored, true);
+    assert.deepEqual((await rpc('madara_V0_1_0_doesNotExist', [])).error,
+      { code: -32601, message: 'Method not found' });
+    assert.equal((await rpc(method, [])).error.code, -32602);
+  } finally {
+    listener.close();
   }
 });
 
