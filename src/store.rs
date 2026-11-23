@@ -38,6 +38,7 @@ pub const VALUES_PER_PAGE: usize = 4096;
 pub struct Update {
     pub application_id: Felt,
     pub dataset_id: Felt,
+    #[serde(deserialize_with = "Option::<Felt>::deserialize")]
     pub base_root: Option<Felt>,
 }
 

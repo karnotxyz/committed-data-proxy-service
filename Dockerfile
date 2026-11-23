@@ -4,6 +4,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release --locked
+RUN cargo test --release --locked
 
 FROM debian:bookworm-slim
 LABEL org.opencontainers.image.source="https://github.com/karnotxyz/committed-data-proxy-service"
