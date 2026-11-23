@@ -11,6 +11,23 @@ function reply(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
+function rpcError(res, id, code, message) {
+  return reply(res, 200, { jsonrpc: '2.0', id, error: { code, message } });
+}
+
+function combinedParams(params) {
+  const values = Array.isArray(params) ? params
+    : params && typeof params === 'object' &&
+      Object.keys(params).every(key => ['datasets', 'transaction'].includes(key))
+      ? [params.datasets, params.transaction] : null;
+  if (!values || values.length !== 2 || !Array.isArray(values[0]) ||
+      values[0].length < 1 || values[0].length > 4 ||
+      typeof values[1] !== 'object' || values[1] === null || Array.isArray(values[1])) {
+    return null;
+  }
+  return values;
+}
+
 export function createServer(archive = null, options = {}) {
   const { forwardTransactions = false, requireC2AckBeforeC1 = true,
     c1RpcUrl, c2ImportUrl, submitRoot = submitRootTransaction,
@@ -20,12 +37,14 @@ export function createServer(archive = null, options = {}) {
   }
   return http.createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/health') {
-      return reply(res, 200, { status: 'ok' });
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      return res.end('OK');
     }
     if (req.method === 'GET' && req.url === '/ready') {
       try {
         if (archive) await archive.ready();
-        return reply(res, 200, { status: 'ok' });
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        return res.end('OK');
       } catch {
         return reply(res, 503, { status: 'unavailable' });
       }
@@ -59,21 +78,19 @@ export function createServer(archive = null, options = {}) {
       }
       const call = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       id = call && Object.hasOwn(call, 'id') ? call.id : null;
-      if (call?.jsonrpc !== '2.0' || call?.method !== method ||
-          !Array.isArray(call?.params) || call.params.length !== 2 ||
-          !Array.isArray(call.params[0]) || call.params[0].length < 1 ||
-          call.params[0].length > 4 || typeof call.params[1] !== 'object' ||
-          call.params[1] === null) {
-        return reply(res, 200, { jsonrpc: '2.0', id,
-          error: { code: -32602, message: 'Invalid params or method' } });
+      if (call?.jsonrpc !== '2.0' || typeof call.method !== 'string') {
+        return rpcError(res, id, -32600, 'Invalid Request');
       }
+      if (call.method !== method) return rpcError(res, id, -32601, 'Method not found');
+      const params = combinedParams(call.params);
+      if (!params) return rpcError(res, id, -32602, 'Invalid params');
       if (!archive) return reply(res, 200, { jsonrpc: '2.0', id,
         error: { code: -32003, message: 'Committed data import is not enabled' } });
       let datasetIds;
       let admissionId;
       try {
-        datasetIds = await archive.store(call.params[0]);
-        admissionId = await archive.stageAdmission(call.params[1], datasetIds);
+        datasetIds = await archive.store(params[0]);
+        admissionId = await archive.stageAdmission(params[1], datasetIds);
       } catch (error) {
         console.error('Committed data archive failed:', error.message);
         return reply(res, 200, { jsonrpc: '2.0', id,
@@ -81,7 +98,7 @@ export function createServer(archive = null, options = {}) {
       }
       if (!forwardTransactions) return reply(res, 200, { jsonrpc: '2.0', id,
         error: { code: -32003, message: 'Committed data import is not enabled' } });
-      if (call.params[1].type !== 'INVOKE' || call.params[1].is_query) {
+      if (params[1].type !== 'INVOKE' || params[1].is_query) {
         return reply(res, 200, { jsonrpc: '2.0', id,
           error: { code: -32602, message: 'Expected signed non-query INVOKE' } });
       }
@@ -105,7 +122,7 @@ export function createServer(archive = null, options = {}) {
           return reply(res, 200, { jsonrpc: '2.0', id,
             error: { code: -32006, message: 'C1 submission is pending reconciliation' } });
         }
-        const result = await submitRoot(c1RpcUrl, call.params[1]);
+        const result = await submitRoot(c1RpcUrl, params[1]);
         await archive.finishSubmission(admissionId, result.transaction_hash);
         return reply(res, 200, { jsonrpc: '2.0', id, result });
       } catch (error) {
