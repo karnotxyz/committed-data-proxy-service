@@ -7,7 +7,7 @@ RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 LABEL org.opencontainers.image.source="https://github.com/karnotxyz/committed-data-proxy-service"
-RUN useradd --uid 10001 --create-home proxy && mkdir /data && chown proxy:proxy /data
+RUN mkdir /data && chown 10001:10001 /data
 COPY --from=builder /app/target/release/committed-data-proxy-service /usr/local/bin/committed-data-proxy-service
 USER 10001:10001
 EXPOSE 9945 8080
