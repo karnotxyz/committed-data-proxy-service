@@ -1,6 +1,10 @@
 use crate::patricia::{
     valid_key, CommittedDataSet, CommittedDataWitness, MAX_COMMITTED_DATA_VALUES,
 };
+use crate::recovery::{
+    namespace_key, RecoveryManifest, RecoveryRecord, DEFAULT_PENDING_BACKUP_BYTES,
+};
+use bincode::Options as _;
 use rocksdb::{
     ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB,
 };
@@ -22,6 +26,7 @@ const ROOTS: &str = "committed_data_roots";
 const VALUES: &str = "committed_data_values";
 const IMPORTS: &str = "committed_data_proxy_imports";
 const ADMISSIONS: &str = "committed_data_proxy_admissions";
+const RECOVERY: &str = "committed_data_recovery";
 const ROOT_PREFIX: &[u8] = b"committed_data_mpt/";
 const VERSION_PREFIX: &[u8] = b"committed_data_versions/";
 const COMPLETE_PREFIX: &[u8] = b"cdv/complete/";
@@ -73,6 +78,22 @@ pub struct Store {
     writer: Mutex<()>,
 }
 
+fn recovery_key(prefix: u8, id: &[u8]) -> Vec<u8> {
+    [&[prefix], id].concat()
+}
+
+fn encode_recovery<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    bincode::DefaultOptions::new()
+        .serialize(value)
+        .map_err(|e| e.to_string())
+}
+
+fn decode_recovery<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    bincode::DefaultOptions::new()
+        .deserialize(bytes)
+        .map_err(|e| e.to_string())
+}
+
 fn cf<'a>(db: &'a DB, name: &str) -> Result<&'a rocksdb::ColumnFamily, String> {
     db.cf_handle(name)
         .ok_or_else(|| format!("missing column {name}"))
@@ -116,7 +137,7 @@ impl Store {
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
-        let columns: Vec<_> = ["default", ROOTS, VALUES, IMPORTS, ADMISSIONS]
+        let columns: Vec<_> = ["default", ROOTS, VALUES, IMPORTS, ADMISSIONS, RECOVERY]
             .into_iter()
             .map(|name| ColumnFamilyDescriptor::new(name, Options::default()))
             .collect();
@@ -284,6 +305,43 @@ impl Store {
         }
         let payload = serde_json::to_vec(dataset).map_err(|e| e.to_string())?;
         let id = hex::encode(Sha256::digest(&payload));
+        let recovery_cf = cf(&self.db, RECOVERY)?;
+        let namespace = namespace_key(dataset.update.as_ref(), dataset.root)?;
+        let identity_key = recovery_key(b'n', &namespace);
+        let existing_recovery = self
+            .db
+            .get_cf(recovery_cf, &identity_key)
+            .map_err(|e| e.to_string())?;
+        let recovery = if existing_recovery.is_none() {
+            let base = dataset
+                .update
+                .as_ref()
+                .and_then(|u| u.base_root)
+                .map(|root| {
+                    let key = recovery_key(b'n', &namespace_key(dataset.update.as_ref(), root)?);
+                    self.db
+                        .get_cf(recovery_cf, key)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "missing base recovery identity".to_owned())
+                        .and_then(|bytes| {
+                            String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())
+                        })
+                })
+                .transpose()?;
+            let record = RecoveryRecord::encode(self.chain_id, dataset, base)?;
+            let record_id = record.manifest.id()?;
+            let record_bytes = encode_recovery(&record)?;
+            let pending = self
+                .pending_recovery_bytes()?
+                .checked_add(record_bytes.len() as u64)
+                .ok_or("recovery backlog overflow")?;
+            if pending > DEFAULT_PENDING_BACKUP_BYTES {
+                return Err("committed-data backup backlog full; retry after export".into());
+            }
+            Some((record, record_id, record_bytes, pending))
+        } else {
+            None
+        };
         let mut batch = WriteBatch::default();
         if self.count(dataset.root)?.is_none() {
             let mut metadata = Vec::with_capacity(21);
@@ -313,10 +371,103 @@ impl Store {
             batch.put_cf(cf(&self.db, ROOTS)?, version_key(update, dataset.root), []);
         }
         batch.put_cf(cf(&self.db, IMPORTS)?, id.as_bytes(), payload);
+        if let Some((record, record_id, bytes, pending)) = recovery {
+            batch.put_cf(recovery_cf, identity_key, record_id.as_bytes());
+            batch.put_cf(
+                recovery_cf,
+                recovery_key(b'm', record_id.as_bytes()),
+                encode_recovery(&record.manifest)?,
+            );
+            batch.put_cf(
+                recovery_cf,
+                recovery_key(b'r', record_id.as_bytes()),
+                &bytes,
+            );
+            batch.put_cf(
+                recovery_cf,
+                recovery_key(b'p', record_id.as_bytes()),
+                encode_recovery(&(bytes.len() as u64))?,
+            );
+            batch.put_cf(recovery_cf, b"bytes", encode_recovery(&pending)?);
+        }
         self.db
             .write_opt(batch, &synced())
             .map_err(|e| e.to_string())?;
         Ok(id)
+    }
+
+    fn pending_recovery_bytes(&self) -> Result<u64, String> {
+        match self
+            .db
+            .get_cf(cf(&self.db, RECOVERY)?, b"bytes")
+            .map_err(|e| e.to_string())?
+        {
+            Some(bytes) => decode_recovery(&bytes),
+            None => Ok(0),
+        }
+    }
+
+    pub fn pending_recovery(&self, limit: usize) -> Result<Vec<(String, RecoveryRecord)>, String> {
+        let cf = cf(&self.db, RECOVERY)?;
+        let mut pending = Vec::new();
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(b"p", Direction::Forward))
+        {
+            let (key, _) = row.map_err(|e| e.to_string())?;
+            if !key.starts_with(b"p") || pending.len() == limit {
+                break;
+            }
+            let id = String::from_utf8(key[1..].to_vec()).map_err(|e| e.to_string())?;
+            let bytes = self
+                .db
+                .get_cf(cf, recovery_key(b'r', id.as_bytes()))
+                .map_err(|e| e.to_string())?
+                .ok_or("missing recovery payload")?;
+            let record: RecoveryRecord = decode_recovery(&bytes)?;
+            if record.manifest.id()? != id {
+                return Err("corrupt recovery identity".into());
+            }
+            pending.push((id, record));
+        }
+        Ok(pending)
+    }
+
+    pub fn recovery_record(&self, id: &str) -> Result<Option<RecoveryRecord>, String> {
+        self.db
+            .get_cf(cf(&self.db, RECOVERY)?, recovery_key(b'r', id.as_bytes()))
+            .map_err(|e| e.to_string())?
+            .map(|bytes| decode_recovery(&bytes))
+            .transpose()
+    }
+
+    pub fn recovery_manifest(&self, id: &str) -> Result<Option<RecoveryManifest>, String> {
+        self.db
+            .get_cf(cf(&self.db, RECOVERY)?, recovery_key(b'm', id.as_bytes()))
+            .map_err(|e| e.to_string())?
+            .map(|bytes| decode_recovery(&bytes))
+            .transpose()
+    }
+
+    pub fn mark_recovery_exported(&self, id: &str) -> Result<(), String> {
+        let _guard = self.writer.lock().map_err(|e| e.to_string())?;
+        let cf = cf(&self.db, RECOVERY)?;
+        let key = recovery_key(b'p', id.as_bytes());
+        let Some(size) = self.db.get_cf(cf, &key).map_err(|e| e.to_string())? else {
+            return Ok(());
+        };
+        let size: u64 = decode_recovery(&size)?;
+        let pending = self
+            .pending_recovery_bytes()?
+            .checked_sub(size)
+            .ok_or("recovery backlog underflow")?;
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(cf, key);
+        batch.delete_cf(cf, recovery_key(b'r', id.as_bytes()));
+        batch.put_cf(cf, b"bytes", encode_recovery(&pending)?);
+        self.db
+            .write_opt(batch, &synced())
+            .map_err(|e| e.to_string())
     }
 
     pub fn load_import(&self, id: &str) -> Result<Dataset, String> {
@@ -507,6 +658,22 @@ mod tests {
         let id = {
             let db = Store::open(dir.path(), Felt::ONE, vec![]).unwrap();
             let id = db.put(&dataset).unwrap();
+            let pending = db.pending_recovery(10).unwrap();
+            assert_eq!(pending.len(), 1);
+            let manifest = &pending[0].1.manifest;
+            assert_eq!(manifest.version, 2);
+            assert_eq!(manifest.chain_id, Felt::ONE);
+            assert_eq!(manifest.root, root);
+            assert_eq!(manifest.entries, 1);
+            assert_eq!(manifest.chunks.len(), 1);
+            assert_eq!(
+                db.recovery_manifest(&pending[0].0)
+                    .unwrap()
+                    .unwrap()
+                    .id()
+                    .unwrap(),
+                pending[0].0
+            );
             assert_eq!(db.roots(None).unwrap(), vec![root]);
             let page = db.page(root, 0).unwrap().unwrap();
             assert_eq!(page["count"], 1);
@@ -520,6 +687,12 @@ mod tests {
             id
         };
         let reopened = Store::open(dir.path(), Felt::ONE, vec![]).unwrap();
+        let pending = reopened.pending_recovery(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        reopened.mark_recovery_exported(&pending[0].0).unwrap();
+        reopened.mark_recovery_exported(&pending[0].0).unwrap();
+        assert!(reopened.pending_recovery(10).unwrap().is_empty());
+        assert!(reopened.recovery_manifest(&pending[0].0).unwrap().is_some());
         assert_eq!(reopened.load_import(&id).unwrap().root, root);
         assert_eq!(reopened.roots(None).unwrap(), vec![root]);
         assert!(reopened.witnesses(root, &[Felt::THREE]).unwrap().unwrap()[0].verify());
@@ -560,6 +733,20 @@ mod tests {
             signatures: vec![],
         };
         db.put(&patch).unwrap();
+        let pending = db.pending_recovery(10).unwrap();
+        assert_eq!(pending.len(), 2);
+        let parent = pending
+            .iter()
+            .find(|(_, record)| record.manifest.root == first)
+            .unwrap()
+            .0
+            .clone();
+        let child = pending
+            .iter()
+            .find(|(_, record)| record.manifest.root == second)
+            .unwrap();
+        assert_eq!(child.1.manifest.base.as_deref(), Some(parent.as_str()));
+        assert_eq!(child.1.manifest.entries, 2); // Back up submitted upserts, not the merged map.
         assert_eq!(db.versions(None).unwrap().len(), 2);
         assert_eq!(db.page(second, 0).unwrap().unwrap()["count"], 3);
         let bad = Dataset {

@@ -1,7 +1,10 @@
+mod archive;
 #[allow(dead_code)] // Keep Madara's pinned tree module intact for compatibility.
 mod patricia;
+mod recovery;
 mod store;
 
+use archive::Archive;
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, DefaultBodyLimit, State},
@@ -30,6 +33,7 @@ const UPDATE: &str = "madara_V0_1_0_updateCommittedDataSet";
 
 struct App {
     store: Store,
+    archive: Option<Archive>,
     client: reqwest::Client,
     forward: bool,
     require_c2_ack: bool,
@@ -429,6 +433,91 @@ async fn smoke(
     }
 }
 
+async fn mongo_smoke(
+    State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> (StatusCode, Json<Value>) {
+    if !peer.ip().is_loopback() {
+        return (StatusCode::NOT_FOUND, Json(json!({"error":"not found"})));
+    }
+    let Some(archive) = &app.archive else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"MongoDB is not configured"})),
+        );
+    };
+    match archive.smoke_write().await {
+        Ok(id) => (StatusCode::OK, Json(json!({"id":id,"stored":true}))),
+        Err(error) => {
+            eprintln!("MongoDB smoke write failed: {error}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"MongoDB write failed"})),
+            )
+        }
+    }
+}
+
+async fn archive_worker(app: Arc<App>) {
+    let Some(archive) = &app.archive else {
+        return;
+    };
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    loop {
+        interval.tick().await;
+        let pending = match app.store.pending_recovery(16) {
+            Ok(pending) => pending,
+            Err(error) => {
+                eprintln!("MongoDB recovery scan failed: {error}");
+                continue;
+            }
+        };
+        for (id, record) in pending {
+            match export_recovery(&app, archive, &id, record).await {
+                Ok(()) => {}
+                Err(error) => eprintln!("MongoDB recovery export failed for {id}: {error}"),
+            }
+        }
+    }
+}
+
+async fn export_recovery(
+    app: &App,
+    archive: &Archive,
+    id: &str,
+    record: recovery::RecoveryRecord,
+) -> Result<(), String> {
+    let mut path = vec![(id.to_owned(), record)];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(base) = path
+        .last()
+        .and_then(|(_, record)| record.manifest.base.clone())
+    {
+        if !seen.insert(base.clone()) || path.len() > 4096 {
+            return Err("recovery dependency cycle or excessive depth".into());
+        }
+        if archive.complete(&base).await? {
+            break;
+        }
+        let parent = app
+            .store
+            .recovery_record(&base)?
+            .ok_or("missing recovery base payload")?;
+        if parent.manifest.id()? != base {
+            return Err("corrupt recovery base identity".into());
+        }
+        path.push((base, parent));
+    }
+    for (id, record) in path.into_iter().rev() {
+        archive.upload(&record).await?;
+        if !archive.complete(&id).await? {
+            return Err("recovery manifest not visible".into());
+        }
+        app.store.mark_recovery_exported(&id)?;
+    }
+    Ok(())
+}
+
 async fn delivery_worker(app: Arc<App>) {
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     loop {
@@ -478,6 +567,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let require_c2_ack = env::var("REQUIRE_C2_ACK_BEFORE_C1").as_deref() != Ok("false");
     let c1_url = env::var("C1_RPC_URL").ok();
     let c2_url = env::var("C2_IMPORT_URL").ok();
+    let mongo_uri = env::var("MONGO_URI").ok();
+    if env::var("MONGO_REQUIRED").as_deref() == Ok("true") && mongo_uri.is_none() {
+        return Err("MONGO_URI required".into());
+    }
+    let archive = if let Some(uri) = mongo_uri {
+        let client = mongodb::Client::with_uri_str(uri).await?;
+        let database =
+            client.database(&env::var("MONGO_DATABASE").unwrap_or("committed_data".into()));
+        Some(Archive::new(
+            &database,
+            &env::var("MONGO_COLLECTION_PREFIX").unwrap_or("mempool_transactions".into()),
+        ))
+    } else {
+        None
+    };
     if forward && (c1_url.is_none() || c2_url.is_none()) {
         return Err("forwarding URLs required".into());
     }
@@ -488,6 +592,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allowed_signers,
         )
         .map_err(std::io::Error::other)?,
+        archive,
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?,
@@ -501,12 +606,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if forward && !require_c2_ack {
         tokio::spawn(delivery_worker(app.clone()));
     }
+    if app.archive.is_some() {
+        tokio::spawn(archive_worker(app.clone()));
+    }
     let rpc = Router::new()
         .route("/", post(rpc))
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/__test/rocksdb-write", post(smoke))
-        .route("/__test/mongo-write", post(smoke))
+        .route("/__test/mongo-write", post(mongo_smoke))
         .layer(DefaultBodyLimit::max(128 * 1024 * 1024))
         .with_state(app.clone());
     let feeder = Router::new()
@@ -541,6 +649,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let app = Arc::new(App {
             store: Store::open(dir.path(), Felt::ONE, vec![]).unwrap(),
+            archive: None,
             client: reqwest::Client::new(),
             forward: false,
             require_c2_ack: true,
@@ -624,6 +733,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let app = Arc::new(App {
             store: Store::open(dir.path(), Felt::ONE, vec![]).unwrap(),
+            archive: None,
             client: reqwest::Client::new(),
             forward: true,
             require_c2_ack: true,
