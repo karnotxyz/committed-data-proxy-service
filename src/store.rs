@@ -568,4 +568,34 @@ mod tests {
         };
         assert!(db.put(&bad).unwrap_err().contains("root mismatch"));
     }
+
+    #[test]
+    fn signer_policy_uses_madara_import_message_and_rejects_tampering() {
+        let dir = tempdir().unwrap();
+        let public_key = starknet_types_core::curve::AffinePoint::generator().x();
+        let db = Store::open(dir.path(), Felt::ONE, vec![public_key]).unwrap();
+        let root = felt_decimal(
+            "3000094458541565324654730242423920536387969495385651240652446843684607154951",
+        );
+        let mut preimage = b"MADARA_COMMITTED_DATA_IMPORT_V1".to_vec();
+        preimage.extend(Felt::ONE.to_bytes_be());
+        preimage.extend(root.to_bytes_be());
+        preimage.extend(1u32.to_be_bytes());
+        let signature =
+            starknet_core::crypto::ecdsa_sign(&Felt::ONE, &starknet_keccak(&preimage)).unwrap();
+        let dataset = Dataset {
+            update: None,
+            root,
+            entries: vec![(Felt::TWO, Felt::from(100))],
+            signatures: vec![ImportSignature {
+                public_key,
+                r: signature.r,
+                s: signature.s,
+            }],
+        };
+        db.put(&dataset).unwrap();
+        let mut bad = dataset;
+        bad.signatures[0].s = Felt::ZERO;
+        assert_eq!(db.put(&bad).unwrap_err(), "unauthorized import");
+    }
 }
