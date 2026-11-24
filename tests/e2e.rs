@@ -282,7 +282,7 @@ async fn committed_data_http_rocksdb_mongo_and_forwarding() {
     let roots = get(&client, "/feeder_gateway/get_committed_data_roots").await;
     assert_eq!(roots, json!([root2, root1]));
     let versions = get(&client, "/feeder_gateway/get_committed_data_versions").await;
-    assert_eq!(versions.len(), 2);
+    assert_eq!(versions.as_array().unwrap().len(), 2);
     assert!(versions
         .as_array()
         .unwrap()
@@ -414,7 +414,8 @@ async fn committed_data_http_rocksdb_mongo_and_forwarding() {
     for (_, manifest) in &records {
         let hash = manifest["chunks"][0].as_str().unwrap();
         let chunk = chunks.find_one(doc! {"_id":hash}).await.unwrap().unwrap();
-        let raw = zstd::stream::decode_all(chunk.get_binary_generic("payload").unwrap()).unwrap();
+        let raw = zstd::stream::decode_all(chunk.get_binary_generic("payload").unwrap().as_slice())
+            .unwrap();
         assert_eq!(
             raw.len(),
             manifest["entries"].as_u64().unwrap() as usize * 64
