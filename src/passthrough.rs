@@ -138,10 +138,11 @@ async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
                 Ok(args) if args.len() == 2 => args,
                 _ => return rpc_error(id, -32602, "Invalid params").into_response(),
             };
-            let datasets: Vec<Dataset> = match serde_json::from_value(args[0].clone()) {
-                Ok(datasets) if (1..=4).contains(&datasets.len()) => datasets,
-                _ => return rpc_error(id, -32602, "Invalid params").into_response(),
-            };
+            let datasets: Vec<Dataset> =
+                match serde_json::from_value::<Vec<Dataset>>(args[0].clone()) {
+                    Ok(datasets) if (1..=4).contains(&datasets.len()) => datasets,
+                    _ => return rpc_error(id, -32602, "Invalid params").into_response(),
+                };
             let transaction = &args[1];
             if !transaction.is_object()
                 || transaction["type"] != "INVOKE"
