@@ -1,6 +1,7 @@
-use axum::{routing::post, Json, Router};
+use axum::{extract::DefaultBodyLimit, routing::post, Json, Router};
 use mongodb::bson::{doc, Document};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
@@ -18,6 +19,21 @@ impl Drop for Proxy {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+async fn post_rpc(client: &reqwest::Client, request: Value) -> (Value, Vec<u8>) {
+    let body = serde_json::to_vec(&request).unwrap();
+    let response = client
+        .post("http://127.0.0.1:9945/")
+        .header("content-type", "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (response, body)
 }
 
 #[tokio::test]
@@ -51,7 +67,8 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
                 .route(
                     "/feeder_gateway/get_committed_data_roots",
                     axum::routing::get(|| async { Json(json!(["0x1"])) }),
-                ),
+                )
+                .layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .await
         .unwrap();
@@ -99,9 +116,14 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(ready, "proxy did not start without RocksDB");
+    let standalone_body = format!(
+        "{{ \"id\": 1, \"method\": \"{IMPORT}\", \"params\": [\"0x1\", [], []], \"jsonrpc\": \"2.0\" }}\n"
+    )
+    .into_bytes();
     let standalone: Value = client
         .post("http://127.0.0.1:9945/")
-        .json(&json!({"jsonrpc":"2.0","id":1,"method":IMPORT,"params":["0x1",[],[]]}))
+        .header("content-type", "application/json")
+        .body(standalone_body.clone())
         .send()
         .await
         .unwrap()
@@ -109,16 +131,12 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
         .await
         .unwrap();
     assert_eq!(standalone["result"], Value::Null);
-    let update: Value = client
-        .post("http://127.0.0.1:9945/")
-        .json(&json!({"jsonrpc":"2.0","id":3,"method":UPDATE,"params":[
-            {"application_id":"0x1","dataset_id":"0x2","base_root":null},"0x1",[],[]]}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let (update, update_body) = post_rpc(
+        &client,
+        json!({"jsonrpc":"2.0","id":3,"method":UPDATE,"params":[
+            {"application_id":"0x1","dataset_id":"0x2","base_root":null},"0x1",[],[]]}),
+    )
+    .await;
     assert_eq!(update["result"], Value::Null);
     let roots: Value = client
         .get("http://127.0.0.1:8080/feeder_gateway/get_committed_data_roots")
@@ -129,18 +147,22 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
         .await
         .unwrap();
     assert_eq!(roots, json!(["0x1"]));
-    let combined: Value = client
-        .post("http://127.0.0.1:9945/")
-        .json(&json!({"jsonrpc":"2.0","id":2,"method":COMBINED,"params":{
+    let (combined, combined_body) = post_rpc(
+        &client,
+        json!({"jsonrpc":"2.0","id":2,"method":COMBINED,"params":{
             "datasets":[{"root":"0x1","entries":[],"signatures":[]}],
-            "transaction":{"type":"INVOKE","nonce":"0x1"}}}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+            "transaction":{"type":"INVOKE","nonce":"0x1"}}}),
+    )
+    .await;
     assert_eq!(combined["result"]["transaction_hash"], "0x123");
+    let (large, large_body) = post_rpc(
+        &client,
+        json!({"jsonrpc":"2.0","id":4,"method":IMPORT,
+            "params":["0x1",[["0x2","x".repeat(17 * 1024 * 1024)]],[]]}),
+    )
+    .await;
+    assert_eq!(large["result"], Value::Null);
+    assert!(large_body.len() > 16 * 1024 * 1024);
     assert_eq!(
         calls.lock().unwrap().as_slice(),
         &[
@@ -148,24 +170,43 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
             ("c2".into(), UPDATE.into()),
             ("c2".into(), IMPORT.into()),
             ("c1".into(), "starknet_addInvokeTransaction".into()),
+            ("c2".into(), IMPORT.into()),
         ]
     );
     let collection = database.collection::<Document>("calls");
-    assert_eq!(collection.count_documents(doc! {}).await.unwrap(), 3);
+    let chunks = database.collection::<Document>("calls_chunks");
+    assert_eq!(collection.count_documents(doc! {}).await.unwrap(), 4);
     let mut cursor = collection
         .find(doc! {})
         .sort(doc! {"received_at_ns": 1})
         .await
         .unwrap();
     let mut methods = Vec::new();
+    let expected_bodies = [standalone_body, update_body, combined_body, large_body];
     while cursor.advance().await.unwrap() {
         let entry = cursor.deserialize_current().unwrap();
         assert!(entry.get_datetime("received_at").is_ok());
         assert!(entry.get_i64("received_at_ns").unwrap() > 0);
-        assert!(entry.get_i64("request_bytes").unwrap() > 0);
+        let index = methods.len();
+        let mut body = Vec::new();
+        for chunk_index in 0..entry.get_i32("chunk_count").unwrap() {
+            let chunk = chunks
+                .find_one(doc! {"_id": format!("{}:{chunk_index}",
+                entry.get_object_id("_id").unwrap().to_hex())})
+                .await
+                .unwrap()
+                .unwrap();
+            body.extend_from_slice(chunk.get_binary_generic("payload").unwrap());
+        }
+        assert_eq!(body.len() as i64, entry.get_i64("request_bytes").unwrap());
+        assert_eq!(
+            Sha256::digest(&body).to_vec(),
+            entry.get_binary_generic("payload_sha256").unwrap().clone()
+        );
+        assert_eq!(body, expected_bodies[index]);
         methods.push(entry.get_str("method").unwrap().to_owned());
     }
-    assert_eq!(methods, [IMPORT, UPDATE, COMBINED]);
+    assert_eq!(methods, [IMPORT, UPDATE, COMBINED, IMPORT]);
     drop(proxy);
     database.drop().await.unwrap();
     c1_task.abort();
