@@ -1,5 +1,5 @@
-//! Stateless mode: C2 owns committed-data validation, persistence, and feeder reads.
-use crate::{params, rpc_error, rpc_result, store::Dataset, COMBINED, IMPORT, UPDATE};
+//! C2 owns committed-data validation, persistence, and feeder reads.
+use crate::audit::Audit;
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, State},
@@ -9,9 +9,44 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    env,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+const COMBINED: &str = "madara_V0_1_0_importCommittedDataAndSubmitTransaction";
+const IMPORT: &str = "madara_V0_1_0_importCommittedDataSet";
+const UPDATE: &str = "madara_V0_1_0_updateCommittedDataSet";
+
+fn rpc_error(id: Value, code: i32, message: &str) -> Json<Value> {
+    Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}))
+}
+
+fn rpc_result(id: Value, result: Value) -> Json<Value> {
+    Json(json!({"jsonrpc":"2.0","id":id,"result":result}))
+}
+
+fn params(value: &Value, fields: &[&str]) -> Result<Vec<Value>, String> {
+    match value {
+        Value::Array(array)
+            if array.len() >= fields.len().saturating_sub(1) && array.len() <= fields.len() =>
+        {
+            Ok(array.clone())
+        }
+        Value::Object(object) if object.keys().all(|key| fields.contains(&key.as_str())) => {
+            Ok(fields
+                .iter()
+                .map(|key| object.get(*key).cloned().unwrap_or(Value::Null))
+                .collect())
+        }
+        _ => Err("Invalid params".into()),
+    }
+}
 
 struct App {
+    audit: Audit,
     client: reqwest::Client,
     c1_url: Option<String>,
     c2_import_url: String,
@@ -100,16 +135,17 @@ async fn relay_rpc(app: &App, body: Bytes) -> Result<Response, String> {
     relay_response(send_with_retry(request).await?)
 }
 
-async fn import_dataset(app: &App, dataset: Dataset, id: usize) -> Result<(), String> {
-    let (method, params) = match dataset.update {
-        Some(update) => (
-            UPDATE,
-            json!([update, dataset.root, dataset.entries, dataset.signatures]),
-        ),
-        None => (
-            IMPORT,
-            json!([dataset.root, dataset.entries, dataset.signatures]),
-        ),
+async fn import_dataset(app: &App, dataset: Value, id: usize) -> Result<(), String> {
+    let object = dataset.as_object().ok_or("Dataset must be an object")?;
+    let root = object.get("root").ok_or("Dataset root is missing")?;
+    let entries = object.get("entries").ok_or("Dataset entries are missing")?;
+    let signatures = object
+        .get("signatures")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let (method, params) = match object.get("update").filter(|update| !update.is_null()) {
+        Some(update) => (UPDATE, json!([update, root, entries, signatures])),
+        None => (IMPORT, json!([root, entries, signatures])),
     };
     let request = app
         .client
@@ -153,7 +189,7 @@ async fn submit_c1(app: &App, transaction: &Value) -> Result<String, String> {
         .ok_or("C1 returned no transaction hash".into())
 }
 
-async fn deliver_datasets(app: &App, datasets: Vec<Dataset>) -> Result<(), String> {
+async fn deliver_datasets(app: &App, datasets: Vec<Value>) -> Result<(), String> {
     for (index, dataset) in datasets.into_iter().enumerate() {
         import_dataset(app, dataset, index).await?;
     }
@@ -161,11 +197,18 @@ async fn deliver_datasets(app: &App, datasets: Vec<Dataset>) -> Result<(), Strin
 }
 
 async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    let received_at = SystemTime::now();
     let call: Value = match serde_json::from_slice(&body) {
         Ok(call) => call,
         Err(_) => return rpc_error(Value::Null, -32700, "Parse error").into_response(),
     };
     let id = call.get("id").cloned().unwrap_or(Value::Null);
+    if let Some(method @ (COMBINED | IMPORT | UPDATE)) = call["method"].as_str() {
+        if let Err(error) = app.audit.record(received_at, method, &id, body.len()).await {
+            eprintln!("MongoDB audit write failed: {error}");
+            return rpc_error(id, -32007, "Audit log unavailable").into_response();
+        }
+    }
     if call["jsonrpc"] != "2.0" {
         return rpc_error(id, -32600, "Invalid Request").into_response();
     }
@@ -185,11 +228,10 @@ async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
                 Ok(args) if args.len() == 2 => args,
                 _ => return rpc_error(id, -32602, "Invalid params").into_response(),
             };
-            let datasets: Vec<Dataset> =
-                match serde_json::from_value::<Vec<Dataset>>(args[0].clone()) {
-                    Ok(datasets) if (1..=4).contains(&datasets.len()) => datasets,
-                    _ => return rpc_error(id, -32602, "Invalid params").into_response(),
-                };
+            let datasets: Vec<Value> = match serde_json::from_value::<Vec<Value>>(args[0].clone()) {
+                Ok(datasets) if (1..=4).contains(&datasets.len()) => datasets,
+                _ => return rpc_error(id, -32602, "Invalid params").into_response(),
+            };
             let transaction = &args[1];
             if !transaction.is_object()
                 || transaction["type"] != "INVOKE"
@@ -268,14 +310,22 @@ async fn ready(State(app): State<Arc<App>>) -> (StatusCode, &'static str) {
         .client
         .get(format!("{}/ready", app.c2_import_url.trim_end_matches('/')))
         .send();
-    match tokio::time::timeout(Duration::from_millis(800), check).await {
-        Ok(Ok(response)) if response.status().is_success() => (StatusCode::OK, "OK"),
-        _ => (StatusCode::SERVICE_UNAVAILABLE, "C2 unavailable"),
+    let dependencies = async { tokio::join!(check, app.audit.ready()) };
+    match tokio::time::timeout(Duration::from_millis(800), dependencies).await {
+        Ok((Ok(response), true)) if response.status().is_success() => (StatusCode::OK, "OK"),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "C2 or MongoDB unavailable"),
     }
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let audit = Audit::connect(
+        &env::var("MONGO_URI")?,
+        &env::var("MONGO_DATABASE").unwrap_or_else(|_| "committed_data".into()),
+        &env::var("MONGO_AUDIT_COLLECTION").unwrap_or_else(|_| "proxy_rpc_calls".into()),
+    )
+    .await?;
     let app = Arc::new(App {
+        audit,
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?,
@@ -414,6 +464,13 @@ mod tests {
             .unwrap();
         });
         let app = Arc::new(App {
+            audit: Audit::connect(
+                &std::env::var("E2E_MONGO_URI").expect("set E2E_MONGO_URI"),
+                "proxy_unit_audit",
+                "calls",
+            )
+            .await
+            .unwrap(),
             client: reqwest::Client::new(),
             c1_url: Some(c1_url),
             c2_import_url: c2_url.clone(),
@@ -503,6 +560,7 @@ mod tests {
         assert_eq!(body["body"], "{\"keys\":[\"0x2\"]}");
         reject.store(true, std::sync::atomic::Ordering::SeqCst);
         let no_ack = Arc::new(App {
+            audit: app.audit.clone(),
             client: app.client.clone(),
             c1_url: app.c1_url.clone(),
             c2_import_url: app.c2_import_url.clone(),

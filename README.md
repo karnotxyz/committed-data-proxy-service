@@ -1,88 +1,42 @@
 # Committed data proxy service
 
-Small Rust ingress for Paradex committed data. It uses Madara's pinned Starknet
-Poseidon Patricia implementation from `madara-alliance/sequencer@1b51ef1e` to
-verify every claimed root and produce authenticated membership and absence
-witnesses. It persists the committed-data root and value records in RocksDB
-column families with Madara's binary keys. Separate proxy-only families retain
-the original signed imports and C1 submission admissions. The database is a
-proxy-owned subset of Madara's layout; it is **not** a full Madara database and
-must not be mounted directly by a Madara node.
+Stateless ingress for Paradex committed data. C2 Madara validates and stores the
+datasets in its own RocksDB and exports them to its MongoDB. This proxy has no
+local dataset database or archive. The proxy uses MongoDB only for an ingress
+audit record of each committed-data RPC call.
 
-Each authenticated import also writes a Madara v2 recovery record to the
-`committed_data_recovery` column in the same synced RocksDB batch. A background
-worker exports its 8,192-entry Zstd chunks and content-addressed manifest to
-MongoDB using journaled majority writes and majority reads. The manifest is
-published after all chunks; its identity and namespace mapping remain in
-RocksDB after the upload payload is acknowledged. Patches keep the exact base
-manifest dependency. The local pending payload is bounded to 512 MiB, so an
-extended MongoDB outage rejects new imports before the backlog grows without
-limit. Imports acknowledge durable local storage; MongoDB export is asynchronous,
-as in Madara.
+- Port 9945 serves `GET /health`, `GET /ready`, and JSON-RPC `POST /`.
+  `madara_V0_1_0_importCommittedDataSet` and
+  `madara_V0_1_0_updateCommittedDataSet` relay their request and response to C2.
+- For `madara_V0_1_0_importCommittedDataAndSubmitTransaction`, the proxy sends
+  each dataset to C2 through its import/update RPC. With
+  `REQUIRE_C2_ACK_BEFORE_C1=true` (default), C1 submission waits until every
+  dataset is acknowledged. With `false`, delivery continues in memory while
+  the signed INVOKE goes to C1 immediately. C2 gets the INVOKE later through
+  block replay; the proxy does not send it to C2.
+- Port 8080 sends every request except local `/health` and `/ready` to C2's
+  feeder gateway and returns C2's status, headers, and body.
 
-The service listens on two ports:
+Configure `C2_IMPORT_URL` (C2 port 9945), `C2_FEEDER_URL` (C2 port 8080),
+`C1_RPC_URL`, `FORWARD_TRANSACTIONS`, `REQUIRE_C2_ACK_BEFORE_C1`, and the required
+`MONGO_URI`. `MONGO_DATABASE` defaults to `committed_data`, and
+`MONGO_AUDIT_COLLECTION` defaults to `proxy_rpc_calls`. Every call to one of the
+three 9945 committed-data methods gets a majority/journal acknowledged MongoDB
+document with UTC receive time, nanosecond Unix time, method, JSON-RPC ID, and
+request size before forwarding. No dataset payload is stored in this audit
+collection. If the audit write fails, the call fails before reaching C1 or C2.
+Combined
+calls return an error while transaction forwarding is disabled. `/ready` checks
+C2's import listener; `/health` is local.
 
-- `9945`: `GET /health`, `GET /ready`, and JSON-RPC `POST /` for
-  `madara_V0_1_0_importCommittedDataAndSubmitTransaction`,
-  `madara_V0_1_0_importCommittedDataSet`, and
-  `madara_V0_1_0_updateCommittedDataSet`.
-- `8080`: `GET /health`, `GET /ready`, and the committed-data feeder routes
-  `get_committed_data_roots`, `get_committed_data_versions`,
-  `get_committed_data`, `get_committed_data_witness`, and
-  `get_committed_data_witnesses` under `/feeder_gateway/`. The last route
-  accepts GET and POST.
+Forwarded requests retry transient transport failures, HTTP 408/429, and HTTP
+5xx up to five times with 1, 2, 4, 8, and 16 second delays. JSON-RPC
+application errors and other HTTP 4xx responses do not retry.
 
-Reads return Madara's JSON field shapes, root and version pagination limits
-(64), value page size (4,096), and authenticated Patricia witnesses. The feeder
-has a four-request admission budget and computes proofs on blocking workers.
-The dedicated 9945 listener does not expose Starknet user or admin RPC methods.
+There is no proxy admission journal or global request ordering. If C1 accepts a
+transaction but its response is lost, retries may submit the same signed
+transaction again. The caller must reconcile the transaction. With C2
+acknowledgment disabled, delivery can be lost if the proxy restarts.
 
-Set `CHAIN_ID` and `ROCKSDB_PATH` (defaults to `/data/rocksdb`).
-Set `MONGO_URI` to enable archive export, `MONGO_DATABASE` (default
-`committed_data`), and `MONGO_COLLECTION_PREFIX` (default
-`mempool_transactions`). Set `MONGO_REQUIRED=true` in deployments so a missing
-URI fails startup. The archive uses Madara's
-`<prefix>_committed_chunks_v2` and `<prefix>_committed_manifests_v2` collections;
-the proxy does not write Madara's transaction or retention collections.
-`COMMITTED_DATA_SIGNERS` is a comma-separated signer allowlist; an empty list
-matches Madara's policy of disabling import signature checks. The service checks
-Madara's domain-separated Stark ECDSA signature messages when the allowlist is
-set. Root publication remains an on-chain transaction, not an import side effect.
-
-`FORWARD_TRANSACTIONS=false` keeps combined calls in archive-only mode and
-returns `-32003` after durable storage. When enabled, configure `C1_RPC_URL`
-and `C2_IMPORT_URL`. With the default `REQUIRE_C2_ACK_BEFORE_C1=true`, the
-proxy imports each dataset to C2 using only its 9945 dataset RPC and waits for
-acknowledgment before sending the signed INVOKE to C1. C2 receives the root
-transaction later through block replay. With acknowledgment disabled, the
-proxy submits to C1 first and a persistent worker retries C2 dataset delivery.
-A transaction marked as submitting is never sent to C1 again automatically,
-even if its response was lost. Operators must reconcile an uncertain admission.
-
-`POST /__test/rocksdb-write` and `POST /__test/mongo-write` on 9945 perform
-write/read/delete smoke checks only from loopback. The MongoDB check uses a
-separate `<prefix>_proxy_smoke` collection.
-
-Set `C2_PASSTHROUGH=true` to run without proxy RocksDB or MongoDB. In this mode,
-`C2_IMPORT_URL` (port 9945) and `C2_FEEDER_URL` (port 8080) are required;
-`CHAIN_ID`, `COMMITTED_DATA_SIGNERS`, `ROCKSDB_PATH`, and `MONGO_URI` are unused.
-Standalone import and update RPC calls are relayed to C2 with their original
-body and response. For a combined call, the proxy sends each dataset to C2's
-import/update RPC. `REQUIRE_C2_ACK_BEFORE_C1=true` (default) waits for every
-acknowledgment before forwarding the signed INVOKE to `C1_RPC_URL`. When false,
-the proxy starts C2 delivery in memory and submits to C1 without waiting;
-delivery can be lost if the proxy exits. `FORWARD_TRANSACTIONS` must be true for
-the C1 step. Forwarded requests on either port retry transient transport,
-timeout, HTTP 429, and HTTP 5xx failures up to five times after 1, 2, 4, 8,
-and 16 seconds. JSON-RPC application errors and other HTTP 4xx responses are
-returned without retry. All other port 8080 requests relay their method, path, query, and body
-to C2 and return its status and body. C2 later receives the INVOKE via
-block replay; the proxy never submits it to C2.
-
-This mode has no proxy admission journal. If C1 accepts a transaction but its
-response is lost, the caller must reconcile the transaction before retrying;
-the proxy cannot distinguish that case from a failed submission. Keep the
-existing stateful mode until that operational tradeoff is accepted.
-
-Run `cargo test` locally. The manually triggered GitHub Actions workflow builds
-and publishes the public GHCR image.
+`cargo test` runs unit and process-level HTTP and MongoDB audit tests. The manually triggered
+GitHub Actions workflow builds and publishes the public GHCR image.

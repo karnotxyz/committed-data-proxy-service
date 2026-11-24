@@ -16,10 +16,8 @@ jobs:
           - 27017:27017
     steps:
       - uses: actions/checkout@v4
-      - run: apt-get update && apt-get install -y clang libclang-dev cmake
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --release --locked --bin committed-data-proxy-service
-      - run: cargo test --release --locked --test e2e
+      - run: cargo test --release --locked
         env:
           E2E_MONGO_URI: mongodb://mongo:27017/?serverSelectionTimeoutMS=2000
   build:
