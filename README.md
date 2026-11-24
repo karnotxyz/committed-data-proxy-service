@@ -2,7 +2,8 @@
 
 Stateless ingress for Paradex committed data. C2 Madara validates and stores the
 datasets in its own RocksDB and exports them to its MongoDB. This proxy has no
-local database or archive.
+local dataset database or archive. The proxy uses MongoDB only for an ingress
+audit record of each committed-data RPC call.
 
 - Port 9945 serves `GET /health`, `GET /ready`, and JSON-RPC `POST /`.
   `madara_V0_1_0_importCommittedDataSet` and
@@ -17,7 +18,14 @@ local database or archive.
   feeder gateway and returns C2's status, headers, and body.
 
 Configure `C2_IMPORT_URL` (C2 port 9945), `C2_FEEDER_URL` (C2 port 8080),
-`C1_RPC_URL`, `FORWARD_TRANSACTIONS`, and `REQUIRE_C2_ACK_BEFORE_C1`. Combined
+`C1_RPC_URL`, `FORWARD_TRANSACTIONS`, `REQUIRE_C2_ACK_BEFORE_C1`, and the required
+`MONGO_URI`. `MONGO_DATABASE` defaults to `committed_data`, and
+`MONGO_AUDIT_COLLECTION` defaults to `proxy_rpc_calls`. Every call to one of the
+three 9945 committed-data methods gets a majority/journal acknowledged MongoDB
+document with UTC receive time, nanosecond Unix time, method, JSON-RPC ID, and
+request size before forwarding. No dataset payload is stored in this audit
+collection. If the audit write fails, the call fails before reaching C1 or C2.
+Combined
 calls return an error while transaction forwarding is disabled. `/ready` checks
 C2's import listener; `/health` is local.
 
@@ -30,5 +38,5 @@ transaction but its response is lost, retries may submit the same signed
 transaction again. The caller must reconcile the transaction. With C2
 acknowledgment disabled, delivery can be lost if the proxy restarts.
 
-`cargo test` runs unit and process-level HTTP tests. The manually triggered
+`cargo test` runs unit and process-level HTTP and MongoDB audit tests. The manually triggered
 GitHub Actions workflow builds and publishes the public GHCR image.

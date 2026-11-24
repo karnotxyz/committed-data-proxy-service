@@ -1,3 +1,4 @@
+mod audit;
 mod passthrough;
 
 #[tokio::main]

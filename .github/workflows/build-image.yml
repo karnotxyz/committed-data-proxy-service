@@ -9,10 +9,17 @@ jobs:
   test:
     runs-on: ubuntu-latest
     container: rust:1.94-bookworm
+    services:
+      mongo:
+        image: mongo:7.0.48
+        ports:
+          - 27017:27017
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release --locked
+        env:
+          E2E_MONGO_URI: mongodb://mongo:27017/?serverSelectionTimeoutMS=2000
   build:
     if: github.event_name == 'workflow_dispatch'
     needs: test

@@ -1,4 +1,5 @@
 //! C2 owns committed-data validation, persistence, and feeder reads.
+use crate::audit::Audit;
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, State},
@@ -8,7 +9,12 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    env,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 const COMBINED: &str = "madara_V0_1_0_importCommittedDataAndSubmitTransaction";
 const IMPORT: &str = "madara_V0_1_0_importCommittedDataSet";
@@ -40,6 +46,7 @@ fn params(value: &Value, fields: &[&str]) -> Result<Vec<Value>, String> {
 }
 
 struct App {
+    audit: Audit,
     client: reqwest::Client,
     c1_url: Option<String>,
     c2_import_url: String,
@@ -190,6 +197,7 @@ async fn deliver_datasets(app: &App, datasets: Vec<Value>) -> Result<(), String>
 }
 
 async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    let received_at = SystemTime::now();
     let call: Value = match serde_json::from_slice(&body) {
         Ok(call) => call,
         Err(_) => return rpc_error(Value::Null, -32700, "Parse error").into_response(),
@@ -197,6 +205,12 @@ async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
     let id = call.get("id").cloned().unwrap_or(Value::Null);
     if call["jsonrpc"] != "2.0" {
         return rpc_error(id, -32600, "Invalid Request").into_response();
+    }
+    if let Some(method @ (COMBINED | IMPORT | UPDATE)) = call["method"].as_str() {
+        if let Err(error) = app.audit.record(received_at, method, &id, body.len()).await {
+            eprintln!("MongoDB audit write failed: {error}");
+            return rpc_error(id, -32007, "Audit log unavailable").into_response();
+        }
     }
     match call["method"].as_str() {
         Some(IMPORT | UPDATE) => match relay_rpc(&app, body).await {
@@ -296,14 +310,22 @@ async fn ready(State(app): State<Arc<App>>) -> (StatusCode, &'static str) {
         .client
         .get(format!("{}/ready", app.c2_import_url.trim_end_matches('/')))
         .send();
-    match tokio::time::timeout(Duration::from_millis(800), check).await {
-        Ok(Ok(response)) if response.status().is_success() => (StatusCode::OK, "OK"),
-        _ => (StatusCode::SERVICE_UNAVAILABLE, "C2 unavailable"),
+    let dependencies = async { tokio::join!(check, app.audit.ready()) };
+    match tokio::time::timeout(Duration::from_millis(800), dependencies).await {
+        Ok((Ok(response), true)) if response.status().is_success() => (StatusCode::OK, "OK"),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "C2 or MongoDB unavailable"),
     }
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let audit = Audit::connect(
+        &env::var("MONGO_URI")?,
+        &env::var("MONGO_DATABASE").unwrap_or_else(|_| "committed_data".into()),
+        &env::var("MONGO_AUDIT_COLLECTION").unwrap_or_else(|_| "proxy_rpc_calls".into()),
+    )
+    .await?;
     let app = Arc::new(App {
+        audit,
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?,
@@ -442,6 +464,13 @@ mod tests {
             .unwrap();
         });
         let app = Arc::new(App {
+            audit: Audit::connect(
+                &std::env::var("E2E_MONGO_URI").expect("set E2E_MONGO_URI"),
+                "proxy_unit_audit",
+                "calls",
+            )
+            .await
+            .unwrap(),
             client: reqwest::Client::new(),
             c1_url: Some(c1_url),
             c2_import_url: c2_url.clone(),
@@ -531,6 +560,7 @@ mod tests {
         assert_eq!(body["body"], "{\"keys\":[\"0x2\"]}");
         reject.store(true, std::sync::atomic::Ordering::SeqCst);
         let no_ack = Arc::new(App {
+            audit: app.audit.clone(),
             client: app.client.clone(),
             c1_url: app.c1_url.clone(),
             c2_import_url: app.c2_import_url.clone(),
