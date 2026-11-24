@@ -68,9 +68,14 @@ Set `C2_PASSTHROUGH=true` to run without proxy RocksDB or MongoDB. In this mode,
 `CHAIN_ID`, `COMMITTED_DATA_SIGNERS`, `ROCKSDB_PATH`, and `MONGO_URI` are unused.
 Standalone import and update RPC calls are relayed to C2 with their original
 body and response. For a combined call, the proxy sends each dataset to C2's
-import/update RPC and waits for every acknowledgment before forwarding the
-signed INVOKE to `C1_RPC_URL`. `FORWARD_TRANSACTIONS` must be true for that C1
-step. All other port 8080 requests relay their method, path, query, and body
+import/update RPC. `REQUIRE_C2_ACK_BEFORE_C1=true` (default) waits for every
+acknowledgment before forwarding the signed INVOKE to `C1_RPC_URL`. When false,
+the proxy starts C2 delivery in memory and submits to C1 without waiting;
+delivery can be lost if the proxy exits. `FORWARD_TRANSACTIONS` must be true for
+the C1 step. Forwarded requests on either port retry transient transport,
+timeout, HTTP 429, and HTTP 5xx failures up to five times after 1, 2, 4, 8,
+and 16 seconds. JSON-RPC application errors and other HTTP 4xx responses are
+returned without retry. All other port 8080 requests relay their method, path, query, and body
 to C2 and return its status and body. C2 later receives the INVOKE via
 block replay; the proxy never submits it to C2.
 

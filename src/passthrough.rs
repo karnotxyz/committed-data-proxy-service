@@ -17,18 +17,68 @@ struct App {
     c2_import_url: String,
     c2_feeder_url: String,
     forward_transactions: bool,
+    require_c2_ack: bool,
+}
+
+const RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+];
+
+struct Upstream {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+fn retryable(status: StatusCode) -> bool {
+    status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+}
+
+async fn send_with_retry(request: reqwest::RequestBuilder) -> Result<Upstream, String> {
+    for attempt in 0..=RETRY_DELAYS.len() {
+        let current = request
+            .try_clone()
+            .ok_or("Request body cannot be retried")?;
+        let failure = match current.send().await {
+            Ok(response) => {
+                let status = response.status();
+                let headers = response.headers().clone();
+                match response.bytes().await {
+                    Ok(body) if !retryable(status) || attempt == RETRY_DELAYS.len() => {
+                        return Ok(Upstream {
+                            status,
+                            headers,
+                            body,
+                        });
+                    }
+                    Ok(_) => format!("upstream returned {status}"),
+                    Err(error) => error.to_string(),
+                }
+            }
+            Err(error) => error.to_string(),
+        };
+        if attempt == RETRY_DELAYS.len() {
+            return Err(failure);
+        }
+        eprintln!("upstream request retry {}: {failure}", attempt + 1);
+        tokio::time::sleep(RETRY_DELAYS[attempt]).await;
+    }
+    unreachable!()
 }
 
 fn gateway_error(message: &str) -> Response {
     (StatusCode::BAD_GATEWAY, Json(json!({"error": message}))).into_response()
 }
 
-async fn relay_response(upstream: reqwest::Response) -> Result<Response, String> {
-    let status = upstream.status();
-    let headers = upstream.headers().clone();
-    let body = upstream.bytes().await.map_err(|error| error.to_string())?;
-    let mut response = Response::builder().status(status);
-    for (name, value) in headers.iter() {
+fn relay_response(upstream: Upstream) -> Result<Response, String> {
+    let mut response = Response::builder().status(upstream.status);
+    for (name, value) in upstream.headers.iter() {
         if !matches!(
             name.as_str(),
             "connection" | "content-length" | "transfer-encoding" | "keep-alive" | "upgrade"
@@ -37,20 +87,17 @@ async fn relay_response(upstream: reqwest::Response) -> Result<Response, String>
         }
     }
     response
-        .body(Body::from(body))
+        .body(Body::from(upstream.body))
         .map_err(|error| error.to_string())
 }
 
 async fn relay_rpc(app: &App, body: Bytes) -> Result<Response, String> {
-    let upstream = app
+    let request = app
         .client
         .post(&app.c2_import_url)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    relay_response(upstream).await
+        .body(body);
+    relay_response(send_with_retry(request).await?)
 }
 
 async fn import_dataset(app: &App, dataset: Dataset, id: usize) -> Result<(), String> {
@@ -64,16 +111,16 @@ async fn import_dataset(app: &App, dataset: Dataset, id: usize) -> Result<(), St
             json!([dataset.root, dataset.entries, dataset.signatures]),
         ),
     };
-    let response = app
+    let request = app
         .client
         .post(&app.c2_import_url)
-        .json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?;
-    let response: Value = response.json().await.map_err(|error| error.to_string())?;
+        .json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}));
+    let response = send_with_retry(request).await?;
+    if !response.status.is_success() {
+        return Err(format!("C2 import returned {}", response.status));
+    }
+    let response: Value =
+        serde_json::from_slice(&response.body).map_err(|error| error.to_string())?;
     if response["jsonrpc"] != "2.0"
         || response["id"] != json!(id)
         || response.get("result").is_none()
@@ -85,20 +132,18 @@ async fn import_dataset(app: &App, dataset: Dataset, id: usize) -> Result<(), St
 }
 
 async fn submit_c1(app: &App, transaction: &Value) -> Result<String, String> {
-    let response: Value = app
+    let request = app
         .client
         .post(app.c1_url.as_ref().ok_or("C1 RPC URL is missing")?)
         .json(&json!({"jsonrpc":"2.0","id":1,
             "method":"starknet_addInvokeTransaction",
-            "params":{"invoke_transaction":transaction}}))
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .json()
-        .await
-        .map_err(|error| error.to_string())?;
+            "params":{"invoke_transaction":transaction}}));
+    let response = send_with_retry(request).await?;
+    if !response.status.is_success() {
+        return Err(format!("C1 returned {}", response.status));
+    }
+    let response: Value =
+        serde_json::from_slice(&response.body).map_err(|error| error.to_string())?;
     if response.get("error").is_some() {
         return Err(format!("C1 rejected: {}", response["error"]));
     }
@@ -106,6 +151,13 @@ async fn submit_c1(app: &App, transaction: &Value) -> Result<String, String> {
         .as_str()
         .map(str::to_owned)
         .ok_or("C1 returned no transaction hash".into())
+}
+
+async fn deliver_datasets(app: &App, datasets: Vec<Dataset>) -> Result<(), String> {
+    for (index, dataset) in datasets.into_iter().enumerate() {
+        import_dataset(app, dataset, index).await?;
+    }
+    Ok(())
 }
 
 async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
@@ -148,12 +200,19 @@ async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
             if serde_json::to_vec(transaction).is_ok_and(|bytes| bytes.len() > 1024 * 1024) {
                 return rpc_error(id, -32602, "Transaction too large").into_response();
             }
-            for (index, dataset) in datasets.into_iter().enumerate() {
-                if let Err(error) = import_dataset(&app, dataset, index).await {
+            if app.require_c2_ack {
+                if let Err(error) = deliver_datasets(&app, datasets).await {
                     eprintln!("C2 import failed: {error}");
                     return rpc_error(id, -32005, "C2 did not acknowledge committed data")
                         .into_response();
                 }
+            } else {
+                let delivery_app = app.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = deliver_datasets(&delivery_app, datasets).await {
+                        eprintln!("C2 import exhausted retries after C1 submission: {error}");
+                    }
+                });
             }
             match submit_c1(&app, transaction).await {
                 Ok(hash) => rpc_result(id, json!({"transaction_hash":hash})).into_response(),
@@ -189,8 +248,8 @@ async fn feeder(
             request = request.header(name, value);
         }
     }
-    match request.send().await {
-        Ok(upstream) => match relay_response(upstream).await {
+    match send_with_retry(request).await {
+        Ok(upstream) => match relay_response(upstream) {
             Ok(response) => response,
             Err(error) => {
                 eprintln!("C2 feeder response failed: {error}");
@@ -224,6 +283,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         c2_import_url: env::var("C2_IMPORT_URL")?,
         c2_feeder_url: env::var("C2_FEEDER_URL")?,
         forward_transactions: env::var("FORWARD_TRANSACTIONS").as_deref() == Ok("true"),
+        require_c2_ack: env::var("REQUIRE_C2_ACK_BEFORE_C1").as_deref() != Ok("false"),
     });
     if app.forward_transactions && app.c1_url.is_none() {
         return Err("C1_RPC_URL required when forwarding transactions".into());
@@ -269,10 +329,15 @@ mod tests {
     async fn c2_owns_datasets_and_feeder_while_c1_receives_only_invoke() {
         let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let reject = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let transient_c2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transient_c1 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transient_feeder = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let c2_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let c2_url = format!("http://{}", c2_listener.local_addr().unwrap());
         let c2_calls = calls.clone();
         let c2_reject = reject.clone();
+        let c2_transient = transient_c2.clone();
+        let feeder_transient = transient_feeder.clone();
         let c2_task = tokio::spawn(async move {
             axum::serve(
                 c2_listener,
@@ -283,25 +348,32 @@ mod tests {
                         post(move |Json(request): Json<Value>| {
                             let calls = c2_calls.clone();
                             let reject = c2_reject.clone();
+                            let transient = c2_transient.clone();
                             async move {
                                 calls.lock().unwrap().push(("c2".into(), request.clone()));
-                                if reject.load(std::sync::atomic::Ordering::SeqCst) {
-                                    Json(json!({"jsonrpc":"2.0","id":request["id"],
-                                    "error":{"code":-32004,"message":"rejected"}}))
+                                if transient.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                    (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"retry"})))
+                                } else if reject.load(std::sync::atomic::Ordering::SeqCst) {
+                                    (StatusCode::OK, Json(json!({"jsonrpc":"2.0","id":request["id"],
+                                    "error":{"code":-32004,"message":"rejected"}})))
                                 } else {
-                                    Json(json!({"jsonrpc":"2.0","id":request["id"],"result":null}))
+                                    (StatusCode::OK, Json(json!({"jsonrpc":"2.0","id":request["id"],"result":null})))
                                 }
                             }
                         }),
                     )
                     .route(
                         "/feeder_gateway/{*path}",
-                        any(|method: Method, uri: Uri, body: Bytes| async move {
-                            (
-                                StatusCode::ACCEPTED,
-                                Json(json!({"method":method.as_str(),
-                            "uri":uri.to_string(),"body":String::from_utf8_lossy(&body)})),
-                            )
+                        any(move |method: Method, uri: Uri, body: Bytes| {
+                            let transient = feeder_transient.clone();
+                            async move {
+                                if transient.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                    (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"retry"})))
+                                } else {
+                                    (StatusCode::ACCEPTED, Json(json!({"method":method.as_str(),
+                                        "uri":uri.to_string(),"body":String::from_utf8_lossy(&body)})))
+                                }
+                            }
                         }),
                     ),
             )
@@ -311,6 +383,7 @@ mod tests {
         let c1_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let c1_url = format!("http://{}", c1_listener.local_addr().unwrap());
         let c1_calls = calls.clone();
+        let c1_transient = transient_c1.clone();
         let c1_task = tokio::spawn(async move {
             axum::serve(
                 c1_listener,
@@ -318,10 +391,21 @@ mod tests {
                     "/",
                     post(move |Json(request): Json<Value>| {
                         let calls = c1_calls.clone();
+                        let transient = c1_transient.clone();
                         async move {
                             calls.lock().unwrap().push(("c1".into(), request.clone()));
-                            Json(json!({"jsonrpc":"2.0","id":request["id"],
-                        "result":{"transaction_hash":"0x123"}}))
+                            if transient.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    Json(json!({"error":"retry"})),
+                                )
+                            } else {
+                                (
+                                    StatusCode::OK,
+                                    Json(json!({"jsonrpc":"2.0","id":request["id"],
+                                    "result":{"transaction_hash":"0x123"}})),
+                                )
+                            }
                         }
                     }),
                 ),
@@ -335,6 +419,7 @@ mod tests {
             c2_import_url: c2_url.clone(),
             c2_feeder_url: c2_url,
             forward_transactions: true,
+            require_c2_ack: true,
         });
         assert_eq!(ready(State(app.clone())).await.0, StatusCode::OK);
         let dataset = json!({"root":"0x1","entries":[["0x2","0x3"]],"signatures":[]});
@@ -356,21 +441,50 @@ mod tests {
                 ["result"]["transaction_hash"],
             "0x123"
         );
-        let calls = calls.lock().unwrap().clone();
-        assert_eq!(calls.last().unwrap().0, "c1");
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.last().unwrap().0, "c1");
         assert_eq!(
-            calls.last().unwrap().1["method"],
+            recorded.last().unwrap().1["method"],
             "starknet_addInvokeTransaction"
         );
-        assert_eq!(calls[calls.len() - 2].1["method"], IMPORT);
+        assert_eq!(recorded[recorded.len() - 2].1["method"], IMPORT);
         let standalone = json!({"jsonrpc":"2.0","id":9,"method":IMPORT,"params":["0x1",[],[]]});
+        transient_c2.store(true, std::sync::atomic::Ordering::SeqCst);
+        let c2_before = recorded.iter().filter(|(target, _)| target == "c2").count();
         assert_eq!(
             json_body(rpc(State(app.clone()), Bytes::from(standalone.to_string())).await).await
                 ["result"],
             Value::Null
         );
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(target, _)| target == "c2")
+                .count(),
+            c2_before + 2
+        );
+        assert_eq!(RETRY_DELAYS.map(|delay| delay.as_secs()), [1, 2, 4, 8, 16]);
+        transient_c1.store(true, std::sync::atomic::Ordering::SeqCst);
+        let c1_before = recorded.iter().filter(|(target, _)| target == "c1").count();
+        assert_eq!(
+            json_body(rpc(State(app.clone()), Bytes::from(request.to_string())).await).await
+                ["result"]["transaction_hash"],
+            "0x123"
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(target, _)| target == "c1")
+                .count(),
+            c1_before + 2
+        );
+        transient_feeder.store(true, std::sync::atomic::Ordering::SeqCst);
         let response = feeder(
-            State(app),
+            State(app.clone()),
             Method::POST,
             "/feeder_gateway/get_committed_data_witnesses?root=0x1"
                 .parse()
@@ -387,6 +501,21 @@ mod tests {
             "/feeder_gateway/get_committed_data_witnesses?root=0x1"
         );
         assert_eq!(body["body"], "{\"keys\":[\"0x2\"]}");
+        reject.store(true, std::sync::atomic::Ordering::SeqCst);
+        let no_ack = Arc::new(App {
+            client: app.client.clone(),
+            c1_url: app.c1_url.clone(),
+            c2_import_url: app.c2_import_url.clone(),
+            c2_feeder_url: app.c2_feeder_url.clone(),
+            forward_transactions: true,
+            require_c2_ack: false,
+        });
+        assert_eq!(
+            json_body(rpc(State(no_ack), Bytes::from(request.to_string())).await).await["result"]
+                ["transaction_hash"],
+            "0x123",
+            "C1 must not wait for a rejected C2 import when acknowledgement is disabled"
+        );
         c1_task.abort();
         c2_task.abort();
     }
