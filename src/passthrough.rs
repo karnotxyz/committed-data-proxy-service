@@ -1,5 +1,4 @@
-//! Stateless mode: C2 owns committed-data validation, persistence, and feeder reads.
-use crate::{params, rpc_error, rpc_result, store::Dataset, COMBINED, IMPORT, UPDATE};
+//! C2 owns committed-data validation, persistence, and feeder reads.
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, State},
@@ -10,6 +9,35 @@ use axum::{
 };
 use serde_json::{json, Value};
 use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+
+const COMBINED: &str = "madara_V0_1_0_importCommittedDataAndSubmitTransaction";
+const IMPORT: &str = "madara_V0_1_0_importCommittedDataSet";
+const UPDATE: &str = "madara_V0_1_0_updateCommittedDataSet";
+
+fn rpc_error(id: Value, code: i32, message: &str) -> Json<Value> {
+    Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}))
+}
+
+fn rpc_result(id: Value, result: Value) -> Json<Value> {
+    Json(json!({"jsonrpc":"2.0","id":id,"result":result}))
+}
+
+fn params(value: &Value, fields: &[&str]) -> Result<Vec<Value>, String> {
+    match value {
+        Value::Array(array)
+            if array.len() >= fields.len().saturating_sub(1) && array.len() <= fields.len() =>
+        {
+            Ok(array.clone())
+        }
+        Value::Object(object) if object.keys().all(|key| fields.contains(&key.as_str())) => {
+            Ok(fields
+                .iter()
+                .map(|key| object.get(*key).cloned().unwrap_or(Value::Null))
+                .collect())
+        }
+        _ => Err("Invalid params".into()),
+    }
+}
 
 struct App {
     client: reqwest::Client,
@@ -100,16 +128,17 @@ async fn relay_rpc(app: &App, body: Bytes) -> Result<Response, String> {
     relay_response(send_with_retry(request).await?)
 }
 
-async fn import_dataset(app: &App, dataset: Dataset, id: usize) -> Result<(), String> {
-    let (method, params) = match dataset.update {
-        Some(update) => (
-            UPDATE,
-            json!([update, dataset.root, dataset.entries, dataset.signatures]),
-        ),
-        None => (
-            IMPORT,
-            json!([dataset.root, dataset.entries, dataset.signatures]),
-        ),
+async fn import_dataset(app: &App, dataset: Value, id: usize) -> Result<(), String> {
+    let object = dataset.as_object().ok_or("Dataset must be an object")?;
+    let root = object.get("root").ok_or("Dataset root is missing")?;
+    let entries = object.get("entries").ok_or("Dataset entries are missing")?;
+    let signatures = object
+        .get("signatures")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let (method, params) = match object.get("update").filter(|update| !update.is_null()) {
+        Some(update) => (UPDATE, json!([update, root, entries, signatures])),
+        None => (IMPORT, json!([root, entries, signatures])),
     };
     let request = app
         .client
@@ -153,7 +182,7 @@ async fn submit_c1(app: &App, transaction: &Value) -> Result<String, String> {
         .ok_or("C1 returned no transaction hash".into())
 }
 
-async fn deliver_datasets(app: &App, datasets: Vec<Dataset>) -> Result<(), String> {
+async fn deliver_datasets(app: &App, datasets: Vec<Value>) -> Result<(), String> {
     for (index, dataset) in datasets.into_iter().enumerate() {
         import_dataset(app, dataset, index).await?;
     }
@@ -185,11 +214,10 @@ async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
                 Ok(args) if args.len() == 2 => args,
                 _ => return rpc_error(id, -32602, "Invalid params").into_response(),
             };
-            let datasets: Vec<Dataset> =
-                match serde_json::from_value::<Vec<Dataset>>(args[0].clone()) {
-                    Ok(datasets) if (1..=4).contains(&datasets.len()) => datasets,
-                    _ => return rpc_error(id, -32602, "Invalid params").into_response(),
-                };
+            let datasets: Vec<Value> = match serde_json::from_value::<Vec<Value>>(args[0].clone()) {
+                Ok(datasets) if (1..=4).contains(&datasets.len()) => datasets,
+                _ => return rpc_error(id, -32602, "Invalid params").into_response(),
+            };
             let transaction = &args[1];
             if !transaction.is_object()
                 || transaction["type"] != "INVOKE"
