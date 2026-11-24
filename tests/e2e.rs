@@ -192,7 +192,7 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
         assert_eq!(body.len() as i64, entry.get_i64("request_bytes").unwrap());
         assert_eq!(
             Sha256::digest(&body).to_vec(),
-            entry.get_binary_generic("payload_sha256").unwrap()
+            entry.get_binary_generic("payload_sha256").unwrap().clone()
         );
         assert_eq!(body, expected_bodies[index]);
         methods.push(entry.get_str("method").unwrap().to_owned());
