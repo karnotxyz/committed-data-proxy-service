@@ -22,12 +22,17 @@ Configure `C2_IMPORT_URL` (C2 port 9945), `C2_FEEDER_URL` (C2 port 8080),
 `MONGO_URI`. `MONGO_DATABASE` defaults to `committed_data`, and
 `MONGO_AUDIT_COLLECTION` defaults to `proxy_rpc_calls`. Every call to one of the
 three 9945 committed-data methods gets a majority/journal acknowledged MongoDB
-document with UTC receive time, nanosecond Unix time, method, JSON-RPC ID, and
-request size before forwarding. No dataset payload is stored in this audit
-collection. If the audit write fails, the call fails before reaching C1 or C2.
-Combined
-calls return an error while transaction forwarding is disabled. `/ready` checks
-C2's import listener; `/health` is local.
+record with UTC receive time, nanosecond Unix time, method, JSON-RPC ID, request
+size, and SHA-256 of the exact incoming JSON body. The complete request body is
+stored in ordered 4 MiB binary documents in `<collection>_chunks`, avoiding
+MongoDB's 16 MiB document limit. The call record is inserted only after every
+chunk is durable. To replay, sort call records by `received_at_ns` and `_id`,
+concatenate chunks named `<call _id>:0` through `<call _id>:<chunk_count-1>`,
+verify `payload_sha256`, then POST the reconstructed bytes to the stored
+`path` (`/`) using the stored `content_type` (`application/json`). If the audit
+write fails, the call fails before reaching C1 or C2. Combined calls return an
+error while transaction forwarding is disabled. `/ready` checks C2 and MongoDB;
+`/health` is local.
 
 Forwarded requests retry transient transport failures, HTTP 408/429, and HTTP
 5xx up to five times with 1, 2, 4, 8, and 16 second delays. JSON-RPC

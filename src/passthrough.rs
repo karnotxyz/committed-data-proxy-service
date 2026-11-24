@@ -204,7 +204,7 @@ async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
     };
     let id = call.get("id").cloned().unwrap_or(Value::Null);
     if let Some(method @ (COMBINED | IMPORT | UPDATE)) = call["method"].as_str() {
-        if let Err(error) = app.audit.record(received_at, method, &id, body.len()).await {
+        if let Err(error) = app.audit.record(received_at, method, &id, &body).await {
             eprintln!("MongoDB audit write failed: {error}");
             return rpc_error(id, -32007, "Audit log unavailable").into_response();
         }
