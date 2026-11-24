@@ -8,6 +8,7 @@ use axum::{
     routing::{any, get, post},
     Json, Router,
 };
+use mongodb::bson::oid::ObjectId;
 use serde_json::{json, Value};
 use std::{
     env,
@@ -198,28 +199,48 @@ async fn deliver_datasets(app: &App, datasets: Vec<Value>) -> Result<(), String>
 
 async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
     let received_at = SystemTime::now();
+    let call_id = ObjectId::new();
+    let request_id = call_id.to_hex();
     let call: Value = match serde_json::from_slice(&body) {
         Ok(call) => call,
         Err(_) => return rpc_error(Value::Null, -32700, "Parse error").into_response(),
     };
     let id = call.get("id").cloned().unwrap_or(Value::Null);
     if let Some(method @ (COMBINED | IMPORT | UPDATE)) = call["method"].as_str() {
-        if let Err(error) = app.audit.record(received_at, method, &id, &body).await {
-            eprintln!("MongoDB audit write failed: {error}");
+        eprintln!(
+            "request={request_id} received method={method} bytes={}",
+            body.len()
+        );
+        if let Err(error) = app
+            .audit
+            .record(call_id, received_at, method, &id, &body)
+            .await
+        {
+            eprintln!("request={request_id} MongoDB audit write failed: {error}");
             return rpc_error(id, -32007, "Audit log unavailable").into_response();
         }
+        eprintln!("request={request_id} MongoDB audit saved method={method}");
     }
     if call["jsonrpc"] != "2.0" {
         return rpc_error(id, -32600, "Invalid Request").into_response();
     }
     match call["method"].as_str() {
-        Some(IMPORT | UPDATE) => match relay_rpc(&app, body).await {
-            Ok(response) => response,
-            Err(error) => {
-                eprintln!("C2 RPC relay failed: {error}");
-                rpc_error(id, -32005, "C2 did not acknowledge committed data").into_response()
+        Some(method @ (IMPORT | UPDATE)) => {
+            eprintln!("request={request_id} forwarding method={method} to C2");
+            match relay_rpc(&app, body).await {
+                Ok(response) => {
+                    eprintln!(
+                        "request={request_id} C2 returned method={method} http_status={}",
+                        response.status()
+                    );
+                    response
+                }
+                Err(error) => {
+                    eprintln!("request={request_id} C2 RPC relay failed: {error}");
+                    rpc_error(id, -32005, "C2 did not acknowledge committed data").into_response()
+                }
             }
-        },
+        }
         Some(COMBINED) => {
             if !app.forward_transactions {
                 return rpc_error(id, -32003, "Transaction forwarding is disabled").into_response();
@@ -242,24 +263,40 @@ async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
             if serde_json::to_vec(transaction).is_ok_and(|bytes| bytes.len() > 1024 * 1024) {
                 return rpc_error(id, -32602, "Transaction too large").into_response();
             }
+            let dataset_count = datasets.len();
+            eprintln!(
+                "request={request_id} forwarding datasets={dataset_count} to C2 ack_before_c1={}",
+                app.require_c2_ack
+            );
             if app.require_c2_ack {
                 if let Err(error) = deliver_datasets(&app, datasets).await {
-                    eprintln!("C2 import failed: {error}");
+                    eprintln!("request={request_id} C2 import failed: {error}");
                     return rpc_error(id, -32005, "C2 did not acknowledge committed data")
                         .into_response();
                 }
+                eprintln!("request={request_id} C2 import acknowledged datasets={dataset_count}");
             } else {
                 let delivery_app = app.clone();
+                let delivery_request_id = request_id.clone();
                 tokio::spawn(async move {
                     if let Err(error) = deliver_datasets(&delivery_app, datasets).await {
-                        eprintln!("C2 import exhausted retries after C1 submission: {error}");
+                        eprintln!("request={delivery_request_id} C2 import exhausted retries after C1 submission: {error}");
+                    } else {
+                        eprintln!("request={delivery_request_id} C2 import acknowledged datasets={dataset_count}");
                     }
                 });
             }
+            eprintln!(
+                "request={request_id} forwarding transaction_type=INVOKE nonce={} to C1",
+                transaction["nonce"]
+            );
             match submit_c1(&app, transaction).await {
-                Ok(hash) => rpc_result(id, json!({"transaction_hash":hash})).into_response(),
+                Ok(hash) => {
+                    eprintln!("request={request_id} C1 accepted transaction_hash={hash}");
+                    rpc_result(id, json!({"transaction_hash":hash})).into_response()
+                }
                 Err(error) => {
-                    eprintln!("C1 submission uncertain: {error}");
+                    eprintln!("request={request_id} C1 submission uncertain: {error}");
                     rpc_error(id, -32006, "C1 submission needs reconciliation").into_response()
                 }
             }

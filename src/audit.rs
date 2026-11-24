@@ -51,6 +51,7 @@ impl Audit {
 
     pub async fn record(
         &self,
+        call_id: ObjectId,
         received_at: SystemTime,
         method: &str,
         rpc_id: &Value,
@@ -58,7 +59,6 @@ impl Audit {
     ) -> mongodb::error::Result<()> {
         let since_epoch = received_at.duration_since(UNIX_EPOCH).unwrap_or_default();
         let id = rpc_id.to_string();
-        let call_id = ObjectId::new();
         let payload_sha256 = Sha256::digest(request_body).to_vec();
         for (index, bytes) in request_body.chunks(CHUNK_BYTES).enumerate() {
             self.chunks
