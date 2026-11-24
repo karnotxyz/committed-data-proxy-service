@@ -116,11 +116,20 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(ready, "proxy did not start without RocksDB");
-    let (standalone, standalone_body) = post_rpc(
-        &client,
-        json!({"jsonrpc":"2.0","id":1,"method":IMPORT,"params":["0x1",[],[]]}),
+    let standalone_body = format!(
+        "{{ \"id\": 1, \"method\": \"{IMPORT}\", \"params\": [\"0x1\", [], []], \"jsonrpc\": \"2.0\" }}\n"
     )
-    .await;
+    .into_bytes();
+    let standalone: Value = client
+        .post("http://127.0.0.1:9945/")
+        .header("content-type", "application/json")
+        .body(standalone_body.clone())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(standalone["result"], Value::Null);
     let (update, update_body) = post_rpc(
         &client,
