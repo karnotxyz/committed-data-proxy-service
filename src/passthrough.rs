@@ -203,14 +203,14 @@ async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
         Err(_) => return rpc_error(Value::Null, -32700, "Parse error").into_response(),
     };
     let id = call.get("id").cloned().unwrap_or(Value::Null);
-    if call["jsonrpc"] != "2.0" {
-        return rpc_error(id, -32600, "Invalid Request").into_response();
-    }
     if let Some(method @ (COMBINED | IMPORT | UPDATE)) = call["method"].as_str() {
         if let Err(error) = app.audit.record(received_at, method, &id, body.len()).await {
             eprintln!("MongoDB audit write failed: {error}");
             return rpc_error(id, -32007, "Audit log unavailable").into_response();
         }
+    }
+    if call["jsonrpc"] != "2.0" {
+        return rpc_error(id, -32600, "Invalid Request").into_response();
     }
     match call["method"].as_str() {
         Some(IMPORT | UPDATE) => match relay_rpc(&app, body).await {
