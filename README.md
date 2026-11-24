@@ -59,9 +59,23 @@ proxy submits to C1 first and a persistent worker retries C2 dataset delivery.
 A transaction marked as submitting is never sent to C1 again automatically,
 even if its response was lost. Operators must reconcile an uncertain admission.
 
+When forwarding is enabled, combined calls enter one synced RocksDB FIFO before
+any dataset import or C1 submission. One worker drains it in admission order;
+each HTTP call waits for its usual transaction-hash result. The default and
+maximum capacity is 10,000 pending calls (`QUEUE_CAPACITY` can lower it).
+At capacity, a new call returns JSON-RPC error `-32007`; retries of an already
+queued call join its existing position. The worker resumes pending calls after
+a proxy restart. A C2 failure keeps the head in place and retries it, while an
+uncertain C1 submission blocks the queue for manual reconciliation. The queue
+depth is available at `GET /__queue/status` on port 9945. FIFO order starts
+when a complete RPC request is admitted, so senders should avoid concurrent
+requests if they need a particular nonce order across the network.
+
 `POST /__test/rocksdb-write` and `POST /__test/mongo-write` on 9945 perform
 write/read/delete smoke checks only from loopback. The MongoDB check uses a
 separate `<prefix>_proxy_smoke` collection.
 
-Run `cargo test` locally. The manually triggered GitHub Actions workflow builds
-and publishes the public GHCR image.
+Run unit tests with `cargo test --bin committed-data-proxy-service`. The
+process-level test needs a disposable MongoDB at `E2E_MONGO_URI` and runs with
+`cargo test --test e2e`. The manually triggered GitHub Actions workflow runs
+both suites before building and publishing the public GHCR image.

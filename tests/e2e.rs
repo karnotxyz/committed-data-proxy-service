@@ -27,6 +27,7 @@ const ROOT_2: &str = "2762990056193044789187981142863463478913795917876497271042
 #[derive(Default)]
 struct MockCalls {
     reject_c2: AtomicBool,
+    delay_next_c2: AtomicBool,
     events: Mutex<Vec<(String, Value)>>,
 }
 
@@ -36,6 +37,9 @@ async fn c2(State(calls): State<Arc<MockCalls>>, Json(request): Json<Value>) -> 
         .lock()
         .unwrap()
         .push(("c2".into(), request.clone()));
+    if calls.delay_next_c2.swap(false, Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
     if calls.reject_c2.load(Ordering::SeqCst) {
         Json(
             json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32004,"message":"not ready"}}),
@@ -87,6 +91,7 @@ async fn start_proxy(
         .env("MONGO_COLLECTION_PREFIX", "mempool_transactions")
         .env("MONGO_REQUIRED", "true")
         .env("FORWARD_TRANSACTIONS", "true")
+        .env("QUEUE_CAPACITY", "2")
         .env("REQUIRE_C2_ACK_BEFORE_C1", "true")
         .env("C1_RPC_URL", c1_url)
         .env("C2_IMPORT_URL", c2_url)
@@ -168,6 +173,25 @@ async fn get(client: &reqwest::Client, path: &str) -> Value {
         response.status()
     );
     response.json().await.unwrap()
+}
+
+async fn wait_pending(client: &reqwest::Client, expected: u64) {
+    for _ in 0..100 {
+        let status: Value = client
+            .get("http://127.0.0.1:9945/__queue/status")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["capacity"], 2);
+        if status["pending"] == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("queue did not reach {expected} pending calls");
 }
 
 #[tokio::test]
@@ -448,6 +472,119 @@ async fn committed_data_http_rocksdb_mongo_and_forwarding() {
         .await,
         witness
     );
+
+    // A single worker preserves admission order even when the first C2 call is slow.
+    calls.events.lock().unwrap().clear();
+    calls.delay_next_c2.store(true, Ordering::SeqCst);
+    let dataset = second.clone();
+    let first_client = client.clone();
+    let first_call = tokio::spawn(async move {
+        rpc(
+            &first_client,
+            COMBINED,
+            json!([[dataset], {"type":"INVOKE","nonce":"0x2"}]),
+        )
+        .await
+    });
+    wait_pending(&client, 1).await;
+    let dataset = second.clone();
+    let second_client = client.clone();
+    let second_call = tokio::spawn(async move {
+        rpc(
+            &second_client,
+            COMBINED,
+            json!([[dataset], {"type":"INVOKE","nonce":"0x3"}]),
+        )
+        .await
+    });
+    wait_pending(&client, 2).await;
+    assert_eq!(
+        rpc(
+            &client,
+            COMBINED,
+            json!([[second], {"type":"INVOKE","nonce":"0x99"}])
+        )
+        .await["error"]["code"],
+        -32007
+    );
+    assert_eq!(
+        first_call.await.unwrap()["result"]["transaction_hash"],
+        "0x123"
+    );
+    assert_eq!(
+        second_call.await.unwrap()["result"]["transaction_hash"],
+        "0x123"
+    );
+    wait_pending(&client, 0).await;
+    let events = calls.events.lock().unwrap();
+    let submitted: Vec<_> = events
+        .iter()
+        .filter(|(target, _)| target == "c1")
+        .map(|(_, request)| request["params"]["invoke_transaction"]["nonce"].clone())
+        .collect();
+    assert_eq!(submitted, json!(["0x2", "0x3"]));
+    let targets: Vec<_> = events.iter().map(|(target, _)| target.as_str()).collect();
+    assert_eq!(targets, ["c2", "c1", "c2", "c1"]);
+    drop(events);
+
+    // Both calls survive a process restart while C2 is unavailable; recovery drains FIFO.
+    calls.events.lock().unwrap().clear();
+    calls.reject_c2.store(true, Ordering::SeqCst);
+    let c = client.clone();
+    let dataset = initial.clone();
+    let fourth = tokio::spawn(async move {
+        c.post("http://127.0.0.1:9945/")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":COMBINED,
+            "params":[[dataset], {"type":"INVOKE","nonce":"0x4"}]}))
+            .send()
+            .await
+    });
+    wait_pending(&client, 1).await;
+    let c = client.clone();
+    let dataset = first.clone();
+    let fifth = tokio::spawn(async move {
+        c.post("http://127.0.0.1:9945/")
+            .json(&json!({"jsonrpc":"2.0","id":2,"method":COMBINED,
+            "params":[[dataset], {"type":"INVOKE","nonce":"0x5"}]}))
+            .send()
+            .await
+    });
+    wait_pending(&client, 2).await;
+    assert!(calls
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(target, _)| target == "c2"));
+    drop(proxy);
+    let _ = fourth.await;
+    let _ = fifth.await;
+    calls.reject_c2.store(false, Ordering::SeqCst);
+    proxy = start_proxy(&dir, &mongo_uri, &database, &c1_url, &c2_url).await;
+    for _ in 0..100 {
+        if calls
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(target, _)| target == "c1")
+            .count()
+            == 2
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    wait_pending(&client, 0).await;
+    let submitted: Vec<_> = calls
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(target, _)| target == "c1")
+        .map(|(_, request)| request["params"]["invoke_transaction"]["nonce"].clone())
+        .collect();
+    assert_eq!(submitted, json!(["0x4", "0x5"]));
     drop(proxy);
     db.drop().await.unwrap();
     c1_task.abort();

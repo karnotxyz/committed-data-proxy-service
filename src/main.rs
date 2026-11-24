@@ -21,11 +21,11 @@ use std::{
     net::SocketAddr,
     path::Path,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use store::{Admission, Dataset, Store, Update};
-use tokio::sync::{Mutex, Semaphore};
+use store::{Admission, Dataset, QueueEnqueue, QueuedCall, Store, Update, MAX_QUEUE_CAPACITY};
+use tokio::sync::{oneshot, Mutex, Notify, Semaphore};
 
 const COMBINED: &str = "madara_V0_1_0_importCommittedDataAndSubmitTransaction";
 const IMPORT: &str = "madara_V0_1_0_importCommittedDataSet";
@@ -42,6 +42,15 @@ struct App {
     // ponytail: one process-wide admission lock; shard by transaction digest if throughput needs it.
     admission_lock: Mutex<()>,
     read_limit: Arc<Semaphore>,
+    queue_capacity: u64,
+    queue_notify: Notify,
+    queue_waiters: StdMutex<HashMap<u64, Vec<oneshot::Sender<Value>>>>,
+}
+
+fn admission_id(transaction: &Value) -> String {
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(transaction).unwrap_or_default(),
+    ))
 }
 
 async fn persist(app: Arc<App>, dataset: Dataset) -> Result<String, String> {
@@ -199,7 +208,7 @@ async fn combined(app: Arc<App>, value: &Value, id: Value) -> Json<Value> {
     if payload.len() > 1024 * 1024 {
         return rpc_error(id, -32602, "Transaction too large");
     }
-    let admission_id = hex::encode(Sha256::digest(&payload));
+    let admission_id = admission_id(transaction);
     {
         let _guard = app.admission_lock.lock().await;
         let existing = match app.store.admission(&admission_id) {
@@ -290,6 +299,114 @@ async fn combined(app: Arc<App>, value: &Value, id: Value) -> Json<Value> {
     }
 }
 
+async fn queued_combined(app: Arc<App>, value: &Value, id: Value) -> Json<Value> {
+    let args = match params(value, &["datasets", "transaction"]) {
+        Ok(args) if args.len() == 2 => args,
+        _ => return rpc_error(id, -32602, "Invalid params"),
+    };
+    let datasets = match serde_json::from_value::<Vec<Dataset>>(args[0].clone()) {
+        Ok(datasets) if (1..=4).contains(&datasets.len()) => datasets,
+        _ => return rpc_error(id, -32602, "Invalid params"),
+    };
+    let transaction = args[1].clone();
+    if transaction["type"] != "INVOKE"
+        || transaction["is_query"] == true
+        || serde_json::to_vec(&transaction).is_ok_and(|bytes| bytes.len() > 1024 * 1024)
+    {
+        return rpc_error(id, -32602, "Expected signed non-query INVOKE");
+    }
+    let call = QueuedCall {
+        admission_id: admission_id(&transaction),
+        datasets,
+        transaction,
+    };
+    let (sender, receiver) = oneshot::channel();
+    let seq = {
+        let mut waiters = app.queue_waiters.lock().unwrap();
+        match app.store.enqueue(&call, app.queue_capacity) {
+            Ok(QueueEnqueue::Pending(seq)) => {
+                waiters.entry(seq).or_default().push(sender);
+                seq
+            }
+            Ok(QueueEnqueue::Full) => return rpc_error(id, -32007, "Proxy queue is full"),
+            Ok(QueueEnqueue::Conflict) => {
+                return rpc_error(id, -32004, "Conflicting transaction admission")
+            }
+            Err(error) => {
+                eprintln!("queue admission failed: {error}");
+                return rpc_error(id, -32004, "Queue admission could not be stored");
+            }
+        }
+    };
+    app.queue_notify.notify_one();
+    match receiver.await {
+        Ok(mut response) => {
+            response["id"] = id;
+            Json(response)
+        }
+        Err(_) => rpc_error(
+            id,
+            -32006,
+            &format!("Queue worker stopped while processing {seq}"),
+        ),
+    }
+}
+
+fn notify_queue_waiters(app: &App, seq: u64, result: Value) {
+    if let Some(waiters) = app.queue_waiters.lock().unwrap().remove(&seq) {
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+    }
+}
+
+async fn queue_worker(app: Arc<App>) {
+    loop {
+        let (seq, call) = match app.store.queue_head() {
+            Ok(Some(head)) => head,
+            Ok(None) => {
+                app.queue_notify.notified().await;
+                continue;
+            }
+            Err(error) => {
+                eprintln!("queue read failed: {error}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        let result = combined(
+            app.clone(),
+            &json!([call.datasets, call.transaction]),
+            Value::Null,
+        )
+        .await
+        .0;
+        let error = result["error"]["code"].as_i64();
+        if error == Some(-32005) {
+            // Keep the head until C2 acknowledges it. Later calls cannot overtake it.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        if error == Some(-32006) {
+            // C1 may have accepted this transaction. Only manual reconciliation can unblock it.
+            eprintln!("queue blocked at {seq}: C1 submission needs reconciliation");
+            notify_queue_waiters(&app, seq, result);
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            continue;
+        }
+        let mut waiters = app.queue_waiters.lock().unwrap();
+        if let Err(error) = app.store.finish_queue_head(seq, &call.admission_id) {
+            eprintln!("queue completion failed at {seq}: {error}");
+            drop(waiters);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        for waiter in waiters.remove(&seq).unwrap_or_default() {
+            let _ = waiter.send(result.clone());
+        }
+    }
+}
+
 async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Json<Value> {
     let call: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -303,6 +420,7 @@ async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Json<Value> {
         return rpc_error(id, -32600, "Invalid Request");
     };
     match method {
+        COMBINED if app.forward => queued_combined(app.clone(), &call["params"], id).await,
         COMBINED => combined(app.clone(), &call["params"], id).await,
         IMPORT | UPDATE => {
             let dataset = match dataset_from_params(method, &call["params"]) {
@@ -411,6 +529,19 @@ async fn ready(State(app): State<Arc<App>>) -> (StatusCode, &'static str) {
         (StatusCode::OK, "OK")
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+    }
+}
+
+async fn queue_status(State(app): State<Arc<App>>) -> (StatusCode, Json<Value>) {
+    match app.store.queue_len() {
+        Ok(pending) => (
+            StatusCode::OK,
+            Json(json!({"pending":pending,"capacity":app.queue_capacity})),
+        ),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"queue unavailable"})),
+        ),
     }
 }
 
@@ -585,6 +716,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if forward && (c1_url.is_none() || c2_url.is_none()) {
         return Err("forwarding URLs required".into());
     }
+    let queue_capacity = env::var("QUEUE_CAPACITY")
+        .map(|value| value.parse::<u64>())
+        .transpose()?
+        .unwrap_or(MAX_QUEUE_CAPACITY);
+    if !(1..=MAX_QUEUE_CAPACITY).contains(&queue_capacity) {
+        return Err("QUEUE_CAPACITY must be between 1 and 10000".into());
+    }
     let app = Arc::new(App {
         store: Store::open(
             Path::new(&env::var("ROCKSDB_PATH").unwrap_or("/data/rocksdb".into())),
@@ -602,7 +740,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         c2_url,
         admission_lock: Mutex::new(()),
         read_limit: Arc::new(Semaphore::new(4)),
+        queue_capacity,
+        queue_notify: Notify::new(),
+        queue_waiters: StdMutex::new(HashMap::new()),
     });
+    if forward {
+        tokio::spawn(queue_worker(app.clone()));
+    }
     if forward && !require_c2_ack {
         tokio::spawn(delivery_worker(app.clone()));
     }
@@ -613,6 +757,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/", post(rpc))
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/__queue/status", get(queue_status))
         .route("/__test/rocksdb-write", post(smoke))
         .route("/__test/mongo-write", post(mongo_smoke))
         .layer(DefaultBodyLimit::max(128 * 1024 * 1024))
@@ -657,6 +802,9 @@ mod tests {
             c2_url: None,
             admission_lock: Mutex::new(()),
             read_limit: Arc::new(Semaphore::new(4)),
+            queue_capacity: MAX_QUEUE_CAPACITY,
+            queue_notify: Notify::new(),
+            queue_waiters: StdMutex::new(HashMap::new()),
         });
         let root = Felt::from_dec_str(
             "3000094458541565324654730242423920536387969495385651240652446843684607154951",
@@ -741,6 +889,9 @@ mod tests {
             c2_url: Some(c2_url),
             admission_lock: Mutex::new(()),
             read_limit: Arc::new(Semaphore::new(4)),
+            queue_capacity: MAX_QUEUE_CAPACITY,
+            queue_notify: Notify::new(),
+            queue_waiters: StdMutex::new(HashMap::new()),
         });
         let root = Felt::from_dec_str(
             "3000094458541565324654730242423920536387969495385651240652446843684607154951",
@@ -749,6 +900,7 @@ mod tests {
         let request = json!({"jsonrpc":"2.0","id":9,"method":COMBINED,
             "params":[[{"root":root,"entries":[["0x2","0x64"]]}],
                 {"type":"INVOKE","nonce":"0x1"}]});
+        let queue_task = tokio::spawn(queue_worker(app.clone()));
         for _ in 0..2 {
             let response = rpc(State(app.clone()), Bytes::from(request.to_string()))
                 .await
@@ -757,6 +909,7 @@ mod tests {
         }
         assert_eq!(c1_calls.load(Ordering::SeqCst), 1);
         assert_eq!(c2_calls.load(Ordering::SeqCst), 2);
+        queue_task.abort();
         c1_task.abort();
         c2_task.abort();
     }

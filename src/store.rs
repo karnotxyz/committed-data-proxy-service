@@ -27,6 +27,10 @@ const VALUES: &str = "committed_data_values";
 const IMPORTS: &str = "committed_data_proxy_imports";
 const ADMISSIONS: &str = "committed_data_proxy_admissions";
 const RECOVERY: &str = "committed_data_recovery";
+const QUEUE: &str = "committed_data_proxy_queue";
+const QUEUE_NEXT: &[u8] = b"meta/next";
+const QUEUE_COUNT: &[u8] = b"meta/count";
+pub const MAX_QUEUE_CAPACITY: u64 = 10_000;
 const ROOT_PREFIX: &[u8] = b"committed_data_mpt/";
 const VERSION_PREFIX: &[u8] = b"committed_data_versions/";
 const COMPLETE_PREFIX: &[u8] = b"cdv/complete/";
@@ -72,6 +76,19 @@ pub struct Admission {
     pub next_attempt_ms: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QueuedCall {
+    pub admission_id: String,
+    pub datasets: Vec<Dataset>,
+    pub transaction: serde_json::Value,
+}
+
+pub enum QueueEnqueue {
+    Pending(u64),
+    Full,
+    Conflict,
+}
+
 pub struct Store {
     db: DB,
     chain_id: Felt,
@@ -81,6 +98,10 @@ pub struct Store {
 
 fn recovery_key(prefix: u8, id: &[u8]) -> Vec<u8> {
     [&[prefix], id].concat()
+}
+
+fn queue_key(seq: u64) -> Vec<u8> {
+    [b"q/".as_slice(), &seq.to_be_bytes()].concat()
 }
 
 fn encode_recovery<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
@@ -138,10 +159,12 @@ impl Store {
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
-        let columns: Vec<_> = ["default", ROOTS, VALUES, IMPORTS, ADMISSIONS, RECOVERY]
-            .into_iter()
-            .map(|name| ColumnFamilyDescriptor::new(name, Options::default()))
-            .collect();
+        let columns: Vec<_> = [
+            "default", ROOTS, VALUES, IMPORTS, ADMISSIONS, RECOVERY, QUEUE,
+        ]
+        .into_iter()
+        .map(|name| ColumnFamilyDescriptor::new(name, Options::default()))
+        .collect();
         let db = DB::open_cf_descriptors(&options, path, columns).map_err(|e| e.to_string())?;
         Ok(Self {
             db,
@@ -606,6 +629,104 @@ impl Store {
             .map_err(|e| e.to_string())
     }
 
+    fn queue_counter(&self, key: &[u8]) -> Result<u64, String> {
+        let Some(bytes) = self
+            .db
+            .get_cf(cf(&self.db, QUEUE)?, key)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(0);
+        };
+        let bytes: [u8; 8] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "invalid queue counter")?;
+        Ok(u64::from_be_bytes(bytes))
+    }
+
+    pub fn queue_len(&self) -> Result<u64, String> {
+        self.queue_counter(QUEUE_COUNT)
+    }
+
+    pub fn enqueue(&self, call: &QueuedCall, capacity: u64) -> Result<QueueEnqueue, String> {
+        let _guard = self.writer.lock().map_err(|e| e.to_string())?;
+        let queue = cf(&self.db, QUEUE)?;
+        let index = [b"i/".as_slice(), call.admission_id.as_bytes()].concat();
+        let encoded = serde_json::to_vec(call).map_err(|e| e.to_string())?;
+        if let Some(seq) = self.db.get_cf(queue, &index).map_err(|e| e.to_string())? {
+            let seq: [u8; 8] = seq
+                .as_slice()
+                .try_into()
+                .map_err(|_| "invalid queue index")?;
+            let seq = u64::from_be_bytes(seq);
+            let existing = self
+                .db
+                .get_cf(queue, queue_key(seq))
+                .map_err(|e| e.to_string())?
+                .ok_or("missing indexed queue item")?;
+            return Ok(if existing.as_ref() == encoded.as_slice() {
+                QueueEnqueue::Pending(seq)
+            } else {
+                QueueEnqueue::Conflict
+            });
+        }
+        let count = self.queue_len()?;
+        if count >= capacity {
+            return Ok(QueueEnqueue::Full);
+        }
+        let seq = self.queue_counter(QUEUE_NEXT)?;
+        let next = seq.checked_add(1).ok_or("queue sequence exhausted")?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(queue, queue_key(seq), encoded);
+        batch.put_cf(queue, index, seq.to_be_bytes());
+        batch.put_cf(queue, QUEUE_NEXT, next.to_be_bytes());
+        batch.put_cf(queue, QUEUE_COUNT, (count + 1).to_be_bytes());
+        self.db
+            .write_opt(batch, &synced())
+            .map_err(|e| e.to_string())?;
+        Ok(QueueEnqueue::Pending(seq))
+    }
+
+    pub fn queue_head(&self) -> Result<Option<(u64, QueuedCall)>, String> {
+        let queue = cf(&self.db, QUEUE)?;
+        let Some(row) = self
+            .db
+            .iterator_cf(queue, IteratorMode::From(b"q/", Direction::Forward))
+            .next()
+        else {
+            return Ok(None);
+        };
+        let (key, value) = row.map_err(|e| e.to_string())?;
+        if !key.starts_with(b"q/") {
+            return Ok(None);
+        }
+        let seq: [u8; 8] = key[2..].try_into().map_err(|_| "invalid queue key")?;
+        let call = serde_json::from_slice(&value).map_err(|e| e.to_string())?;
+        Ok(Some((u64::from_be_bytes(seq), call)))
+    }
+
+    pub fn finish_queue_head(&self, seq: u64, admission_id: &str) -> Result<(), String> {
+        let _guard = self.writer.lock().map_err(|e| e.to_string())?;
+        let Some((head, call)) = self.queue_head()? else {
+            return Err("queue head is missing".into());
+        };
+        if head != seq || call.admission_id != admission_id {
+            return Err("queue order changed".into());
+        }
+        let count = self
+            .queue_len()?
+            .checked_sub(1)
+            .ok_or("queue count underflow")?;
+        let queue = cf(&self.db, QUEUE)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(queue, queue_key(seq));
+        batch.delete_cf(queue, [b"i/".as_slice(), admission_id.as_bytes()].concat());
+        batch.put_cf(queue, QUEUE_COUNT, count.to_be_bytes());
+        self.db
+            .write_opt(batch, &synced())
+            .map_err(|e| e.to_string())
+    }
+
     pub fn smoke_write(&self) -> Result<String, String> {
         let id = format!("smoke/{}", Uuid::new_v4());
         self.db
@@ -639,6 +760,60 @@ impl Store {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn durable_queue_is_fifo_deduplicated_and_bounded() {
+        assert_eq!(MAX_QUEUE_CAPACITY, 10_000);
+        let dir = tempdir().unwrap();
+        let first = QueuedCall {
+            admission_id: "first".into(),
+            datasets: vec![],
+            transaction: serde_json::json!({"nonce":"0x1"}),
+        };
+        let second = QueuedCall {
+            admission_id: "second".into(),
+            datasets: vec![],
+            transaction: serde_json::json!({"nonce":"0x2"}),
+        };
+        let third = QueuedCall {
+            admission_id: "third".into(),
+            datasets: vec![],
+            transaction: serde_json::json!({"nonce":"0x3"}),
+        };
+        {
+            let db = Store::open(dir.path(), Felt::ONE, vec![]).unwrap();
+            assert!(matches!(
+                db.enqueue(&first, 2).unwrap(),
+                QueueEnqueue::Pending(0)
+            ));
+            assert!(matches!(
+                db.enqueue(&second, 2).unwrap(),
+                QueueEnqueue::Pending(1)
+            ));
+            assert!(matches!(
+                db.enqueue(&first, 2).unwrap(),
+                QueueEnqueue::Pending(0)
+            ));
+            let mut conflict = first.clone();
+            conflict.transaction = serde_json::json!({"nonce":"0x99"});
+            assert!(matches!(
+                db.enqueue(&conflict, 2).unwrap(),
+                QueueEnqueue::Conflict
+            ));
+            assert!(matches!(db.enqueue(&third, 2).unwrap(), QueueEnqueue::Full));
+            assert_eq!(db.queue_len().unwrap(), 2);
+        }
+        let db = Store::open(dir.path(), Felt::ONE, vec![]).unwrap();
+        assert_eq!(db.queue_head().unwrap().unwrap().1.admission_id, "first");
+        db.finish_queue_head(0, "first").unwrap();
+        assert_eq!(db.queue_head().unwrap().unwrap().1.admission_id, "second");
+        db.finish_queue_head(1, "second").unwrap();
+        assert_eq!(db.queue_len().unwrap(), 0);
+        assert!(matches!(
+            db.enqueue(&third, 2).unwrap(),
+            QueueEnqueue::Pending(2)
+        ));
+    }
 
     fn felt_decimal(value: &str) -> Felt {
         Felt::from_dec_str(value).unwrap()
