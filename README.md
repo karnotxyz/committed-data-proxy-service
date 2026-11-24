@@ -63,5 +63,21 @@ even if its response was lost. Operators must reconcile an uncertain admission.
 write/read/delete smoke checks only from loopback. The MongoDB check uses a
 separate `<prefix>_proxy_smoke` collection.
 
+Set `C2_PASSTHROUGH=true` to run without proxy RocksDB or MongoDB. In this mode,
+`C2_IMPORT_URL` (port 9945) and `C2_FEEDER_URL` (port 8080) are required;
+`CHAIN_ID`, `COMMITTED_DATA_SIGNERS`, `ROCKSDB_PATH`, and `MONGO_URI` are unused.
+Standalone import and update RPC calls are relayed to C2 with their original
+body and response. For a combined call, the proxy sends each dataset to C2's
+import/update RPC and waits for every acknowledgment before forwarding the
+signed INVOKE to `C1_RPC_URL`. `FORWARD_TRANSACTIONS` must be true for that C1
+step. Feeder requests under `/feeder_gateway/` relay their method, path, query,
+and body to C2 and return its status and body. C2 later receives the INVOKE via
+block replay; the proxy never submits it to C2.
+
+This mode has no proxy admission journal. If C1 accepts a transaction but its
+response is lost, the caller must reconcile the transaction before retrying;
+the proxy cannot distinguish that case from a failed submission. Keep the
+existing stateful mode until that operational tradeoff is accepted.
+
 Run `cargo test` locally. The manually triggered GitHub Actions workflow builds
 and publishes the public GHCR image.

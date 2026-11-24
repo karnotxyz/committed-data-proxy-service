@@ -1,4 +1,5 @@
 mod archive;
+mod passthrough;
 #[allow(dead_code)] // Keep Madara's pinned tree module intact for compatibility.
 mod patricia;
 mod recovery;
@@ -556,6 +557,9 @@ async fn delivery_worker(app: Arc<App>) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("C2_PASSTHROUGH").as_deref() == Ok("true") {
+        return passthrough::run().await;
+    }
     let chain_id = Felt::from_str(&env::var("CHAIN_ID")?)?;
     let allowed_signers = env::var("COMMITTED_DATA_SIGNERS")
         .unwrap_or_default()
