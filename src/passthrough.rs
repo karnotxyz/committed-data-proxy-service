@@ -237,7 +237,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let feeder = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/ready", get(ready))
-        .route("/feeder_gateway/{*path}", any(feeder))
+        .fallback(any(feeder))
         .layer(DefaultBodyLimit::disable())
         .with_state(app.clone());
     let rpc_listener =
