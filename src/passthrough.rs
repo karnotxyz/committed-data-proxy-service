@@ -31,12 +31,7 @@ async fn relay_response(upstream: reqwest::Response) -> Result<Response, String>
     for (name, value) in headers.iter() {
         if !matches!(
             name.as_str(),
-            "connection"
-                | "content-length"
-                | "transfer-encoding"
-                | "content-encoding"
-                | "keep-alive"
-                | "upgrade"
+            "connection" | "content-length" | "transfer-encoding" | "keep-alive" | "upgrade"
         ) {
             response = response.header(name, value);
         }
