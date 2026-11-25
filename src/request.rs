@@ -7,6 +7,14 @@ pub const UPDATE: &str = "madara_V0_1_0_updateCommittedDataSet";
 pub struct ArchivedRequest<'a> {
     pub roots: Vec<String>,
     pub transaction: Option<&'a Value>,
+    pub datasets: Vec<RawDataset<'a>>,
+}
+
+pub struct RawDataset<'a> {
+    pub root: &'a Value,
+    pub entries: &'a Value,
+    pub signatures: &'a Value,
+    pub update: Option<&'a Value>,
 }
 
 fn params<'a, const N: usize>(value: &'a Value, fields: [&str; N]) -> Option<[&'a Value; N]> {
@@ -65,7 +73,7 @@ fn validate_update(update: &Value) -> Result<(), &'static str> {
 
 pub fn parse(call: &Value) -> Result<ArchivedRequest<'_>, &'static str> {
     let input = &call["params"];
-    let (roots, transaction) = match call["method"].as_str() {
+    let (datasets, transaction) = match call["method"].as_str() {
         Some(COMBINED) => {
             let [datasets, transaction] =
                 params(input, ["datasets", "transaction"]).ok_or("Invalid params")?;
@@ -79,32 +87,58 @@ pub fn parse(call: &Value) -> Result<ArchivedRequest<'_>, &'static str> {
             if serde_json::to_vec(transaction).is_ok_and(|bytes| bytes.len() > 1024 * 1024) {
                 return Err("Transaction too large");
             }
-            let mut roots = Vec::with_capacity(datasets.len());
-            for dataset in datasets {
-                if !dataset["update"].is_null() {
-                    validate_update(&dataset["update"])?;
-                }
-                roots.push(dataset_root(
-                    &dataset["root"],
-                    &dataset["entries"],
-                    &dataset["signatures"],
-                )?);
-            }
-            (roots, Some(transaction))
+            let datasets = datasets
+                .iter()
+                .map(|dataset| RawDataset {
+                    root: &dataset["root"],
+                    entries: &dataset["entries"],
+                    signatures: &dataset["signatures"],
+                    update: dataset.get("update").filter(|value| !value.is_null()),
+                })
+                .collect();
+            (datasets, Some(transaction))
         }
         Some(IMPORT) => {
             let [root, entries, signatures] =
                 params(input, ["root", "entries", "signatures"]).ok_or("Invalid params")?;
-            (vec![dataset_root(root, entries, signatures)?], None)
+            (
+                vec![RawDataset {
+                    root,
+                    entries,
+                    signatures,
+                    update: None,
+                }],
+                None,
+            )
         }
         Some(UPDATE) => {
             let [update, root, entries, signatures] =
                 params(input, ["update", "root", "entries", "signatures"])
                     .ok_or("Invalid params")?;
-            validate_update(update)?;
-            (vec![dataset_root(root, entries, signatures)?], None)
+            (
+                vec![RawDataset {
+                    root,
+                    entries,
+                    signatures,
+                    update: Some(update),
+                }],
+                None,
+            )
         }
         _ => return Err("Method not found"),
     };
-    Ok(ArchivedRequest { roots, transaction })
+    let roots = datasets
+        .iter()
+        .map(|dataset| {
+            if let Some(update) = dataset.update {
+                validate_update(update)?;
+            }
+            dataset_root(dataset.root, dataset.entries, dataset.signatures)
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(ArchivedRequest {
+        roots,
+        transaction,
+        datasets,
+    })
 }

@@ -2,22 +2,32 @@
 
 Port 9945 accepts Paradex's committed-data JSON-RPC requests at `POST /`.
 For `madara_V0_1_0_importCommittedDataAndSubmitTransaction`, the proxy first
-archives the signed dataset payloads and the signed INVOKE in MongoDB. Once
-the archive is durable, the original signed INVOKE goes to C1 through
-`starknet_addInvokeTransaction`. The result contains C1's transaction hash.
+archives the signed dataset payloads and the signed INVOKE in MongoDB. With
+the MongoDB feeder enabled, the proxy also validates and materializes the
+datasets. Once those writes are durable, the original signed INVOKE goes
+to C1 through `starknet_addInvokeTransaction`. The result contains C1's
+transaction hash.
 Standalone `madara_V0_1_0_importCommittedDataSet` and
-`madara_V0_1_0_updateCommittedDataSet` acknowledge archival with a null
+`madara_V0_1_0_updateCommittedDataSet` acknowledge storage with a null
 result. C2 validates and imports datasets later through the replay service.
 
-Port 8080 relays feeder requests and responses to C2. Both ports expose a
-local `/health` probe. The 9945 `/ready` checks MongoDB and the 8080 `/ready`
-checks the C2 feeder.
+Port 8080 serves committed-data feeder routes according to
+`MONGO_FEEDER_ENABLED`.
+
+- `false` (default) relays feeder requests and responses to `C2_FEEDER_URL`.
+- `true` serves roots, versions, data pages, and witnesses directly from
+  MongoDB. Set `CHAIN_ID` to the chain ID used to sign datasets and
+  `COMMITTED_DATA_SIGNERS` to the comma-separated signer public keys.
+  An empty allowlist disables signature checks.
+
+Both ports expose a local `/health` probe. Port 9945 checks MongoDB on
+`/ready`. Port 8080 checks its configured feeder backend on `/ready`.
 
 ## Configuration and archive
 
-Set `MONGO_URI`, `C2_FEEDER_URL` (C2 port 8080), and `C1_RPC_URL` when
-`FORWARD_TRANSACTIONS=true`. With forwarding disabled, recognized calls
-are still archived and combined calls return a forwarding-disabled error.
+Set `MONGO_URI` and, when `FORWARD_TRANSACTIONS=true`, `C1_RPC_URL`. With
+forwarding disabled, recognized calls are still archived and combined
+calls return a forwarding-disabled error.
 
 `MONGO_DATABASE` defaults to `committed_data`. `MONGO_AUDIT_COLLECTION`
 defaults to `proxy_rpc_calls`. Requests are stored as exact JSON bytes in
@@ -27,10 +37,22 @@ count, chunk count, SHA-256, and an indexed `dataset_roots` array of
 canonical hexadecimal roots. Writes use majority and journal
 acknowledgment. An audit failure prevents C1 submission.
 
+The local feeder stores root and version records and shared data pages in
+`committed_data_datasets`. Indexed lookups serve the root and version
+lists and retrieve individual data pages. Witnesses use the standard
+Patricia tree for the stored root. A materialization failure prevents C1
+submission when the local feeder is enabled.
+
 Run the same binary with `--index-archive` before enabling Mongo-backed
 replay on an existing archive. It indexes legacy manifests in place after
 checking the ordered chunks and SHA-256. The command can be rerun. It
 reads and updates MongoDB without starting listeners.
+
+To serve historical roots from MongoDB, run the binary with
+`MONGO_FEEDER_ENABLED=true` and `--materialize-archive` before switching
+port 8080 to local reads. This command checks the archived payloads and
+materializes them in receive order. It can be rerun and does not start
+listeners or submit transactions.
 
 Forwarded requests retry transient transport errors and HTTP 408, 429 or
 5xx responses. A caller that loses a C1 response should reconcile the

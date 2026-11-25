@@ -1,6 +1,8 @@
-//! Archive committed-data ingress and relay C1 submissions and C2 feeder reads.
+//! Archive committed-data ingress, submit root transactions to C1, and serve feeder reads.
 use crate::{
     audit::{Audit, MAX_REQUEST_BYTES},
+    datasets::DatasetStore,
+    mongo_feeder,
     request::{self, COMBINED, IMPORT, UPDATE},
 };
 use axum::{
@@ -28,11 +30,16 @@ fn rpc_result(id: Value, result: Value) -> Json<Value> {
     Json(json!({"jsonrpc":"2.0","id":id,"result":result}))
 }
 
+enum Feeder {
+    Mongo(Arc<DatasetStore>, Arc<tokio::sync::Semaphore>),
+    Relay(String),
+}
+
 struct App {
     audit: Audit,
     client: reqwest::Client,
     c1_url: Option<String>,
-    c2_feeder_url: String,
+    feeder: Feeder,
     forward_transactions: bool,
 }
 
@@ -150,10 +157,6 @@ async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
             .as_ref()
             .map(|request| request.roots.as_slice())
             .unwrap_or_default();
-        eprintln!(
-            "request={request_id} received method={method} bytes={}",
-            body.len()
-        );
         if let Err(error) = app
             .audit
             .record(call_id, received_at, method, &id, &body, roots)
@@ -163,7 +166,8 @@ async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
             return rpc_error(id, -32007, "Audit log unavailable").into_response();
         }
         eprintln!(
-            "request={request_id} MongoDB audit saved method={method} roots={}",
+            "request={request_id} MongoDB audit saved method={method} bytes={} roots={}",
+            body.len(),
             roots.len()
         );
     }
@@ -177,16 +181,22 @@ async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
         Ok(request) => request,
         Err(message) => return rpc_error(id, -32602, message).into_response(),
     };
+    if let Feeder::Mongo(store, _) = &app.feeder {
+        let dataset_count = request.datasets.len();
+        for dataset in request.datasets {
+            if let Err(error) = store.put(dataset).await {
+                eprintln!("request={request_id} MongoDB dataset import failed: {error}");
+                return rpc_error(id, -32005, &error).into_response();
+            }
+        }
+        eprintln!("request={request_id} MongoDB materialized datasets={dataset_count}");
+    }
     let Some(transaction) = request.transaction else {
         return rpc_result(id, Value::Null).into_response();
     };
     if !app.forward_transactions {
         return rpc_error(id, -32003, "Transaction forwarding is disabled").into_response();
     }
-    eprintln!(
-        "request={request_id} forwarding transaction_type=INVOKE nonce={} to C1",
-        transaction["nonce"]
-    );
     match submit_c1(&app, transaction).await {
         Ok(hash) => {
             eprintln!("request={request_id} C1 accepted transaction_hash={hash}");
@@ -206,7 +216,13 @@ async fn feeder(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let url = format!("{}{}", app.c2_feeder_url.trim_end_matches('/'), uri);
+    let upstream = match &app.feeder {
+        Feeder::Mongo(store, limit) => {
+            return mongo_feeder::serve(store.clone(), limit.clone(), method, uri, body).await;
+        }
+        Feeder::Relay(url) => url,
+    };
+    let url = format!("{}{}", upstream.trim_end_matches('/'), uri);
     let mut request = app.client.request(method, url).body(body);
     for (name, value) in headers.iter() {
         if !matches!(
@@ -244,12 +260,12 @@ async fn write_ready(State(app): State<Arc<App>>) -> (StatusCode, &'static str) 
 }
 
 async fn feeder_ready(State(app): State<Arc<App>>) -> (StatusCode, &'static str) {
+    let Feeder::Relay(url) = &app.feeder else {
+        return write_ready(State(app)).await;
+    };
     let check = app
         .client
-        .get(format!(
-            "{}/health",
-            app.c2_feeder_url.trim_end_matches('/')
-        ))
+        .get(format!("{}/health", url.trim_end_matches('/')))
         .send();
     match tokio::time::timeout(Duration::from_millis(800), check).await {
         Ok(Ok(response)) if response.status().is_success() => (StatusCode::OK, "OK"),
@@ -257,14 +273,26 @@ async fn feeder_ready(State(app): State<Arc<App>>) -> (StatusCode, &'static str)
     }
 }
 
-pub async fn run(audit: Audit) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    audit: Audit,
+    store: Option<DatasetStore>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let feeder_body_limit = if store.is_some() {
+        DefaultBodyLimit::max(mongo_feeder::MAX_BODY_BYTES)
+    } else {
+        DefaultBodyLimit::disable()
+    };
+    let backend = match store {
+        Some(store) => Feeder::Mongo(Arc::new(store), Arc::new(tokio::sync::Semaphore::new(4))),
+        None => Feeder::Relay(env::var("C2_FEEDER_URL")?),
+    };
     let app = Arc::new(App {
         audit,
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?,
         c1_url: env::var("C1_RPC_URL").ok(),
-        c2_feeder_url: env::var("C2_FEEDER_URL")?,
+        feeder: backend,
         forward_transactions: env::var("FORWARD_TRANSACTIONS").as_deref() == Ok("true"),
     });
     if app.forward_transactions && app.c1_url.is_none() {
@@ -280,14 +308,18 @@ pub async fn run(audit: Audit) -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(|| async { "OK" }))
         .route("/ready", get(feeder_ready))
         .fallback(any(feeder))
-        .layer(DefaultBodyLimit::disable())
+        .layer(feeder_body_limit)
         .with_state(app.clone());
     let rpc_listener =
         tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 9945))).await?;
     let feeder_listener =
         tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 8080))).await?;
+    let feeder_backend = match &app.feeder {
+        Feeder::Mongo(..) => "mongodb",
+        Feeder::Relay(_) => "c2",
+    };
     eprintln!(
-        "committed-data proxy listening on 9945 and 8080; MongoDB archive, C1 forwarding={}",
+        "committed-data proxy ready rpc_port=9945 feeder_port=8080 feeder_backend={feeder_backend} c1_forwarding={}",
         app.forward_transactions
     );
     tokio::try_join!(

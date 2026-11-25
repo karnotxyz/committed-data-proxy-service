@@ -1,7 +1,7 @@
-use crate::request;
+use crate::{datasets::DatasetStore, request};
 use mongodb::{
     bson::{doc, oid::ObjectId, spec::BinarySubtype, Binary, Bson, DateTime, Document},
-    options::{Acknowledgment, CollectionOptions, WriteConcern},
+    options::{Acknowledgment, CollectionOptions, ReadConcern, WriteConcern},
     Client, Collection, Database, IndexModel,
 };
 use serde_json::Value;
@@ -37,6 +37,7 @@ impl Audit {
     ) -> mongodb::error::Result<Self> {
         let client = Client::with_uri_str(uri).await?;
         let options = CollectionOptions::builder()
+            .read_concern(ReadConcern::majority())
             .write_concern(
                 WriteConcern::builder()
                     .w(Acknowledgment::Majority)
@@ -143,6 +144,52 @@ impl Audit {
             indexed += result.modified_count;
         }
         Ok(indexed)
+    }
+
+    pub fn database(&self) -> &Database {
+        &self.database
+    }
+
+    pub async fn materialize_archive(
+        &self,
+        store: &DatasetStore,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let mut cursor = self
+            .calls
+            .find(doc! {})
+            .sort(doc! {"received_at_ns":1, "_id":1})
+            .allow_disk_use(true)
+            .await?;
+        let mut imported = 0;
+        while cursor.advance().await? {
+            let manifest = cursor.deserialize_current()?;
+            let id = manifest.get_object_id("_id")?;
+            let payload = self
+                .read_payload(&manifest, id)
+                .await
+                .map_err(|error| format!("Audit request {id}: {error}"))?;
+            let call: Value = serde_json::from_slice(&payload)?;
+            if call["jsonrpc"] != "2.0" {
+                continue;
+            }
+            let Ok(request) = request::parse(&call) else {
+                continue;
+            };
+            for dataset in request.datasets {
+                if !store
+                    .contains(&dataset)
+                    .await
+                    .map_err(|error| format!("Audit request {id}: {error}"))?
+                {
+                    store
+                        .put(dataset)
+                        .await
+                        .map_err(|error| format!("Audit request {id}: {error}"))?;
+                    imported += 1;
+                }
+            }
+        }
+        Ok(imported)
     }
 
     async fn read_payload(
