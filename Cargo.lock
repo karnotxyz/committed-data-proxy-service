@@ -271,6 +271,7 @@ dependencies = [
  "sha2 0.10.9",
  "starknet-rust-core",
  "starknet-types-core",
+ "subtle",
  "thiserror",
  "tokio",
  "zstd",

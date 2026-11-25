@@ -43,10 +43,27 @@ lists and retrieve individual data pages. Witnesses use the standard
 Patricia tree for the stored root. A materialization failure prevents C1
 submission when the local feeder is enabled.
 
-Run the same binary with `--index-archive` before enabling Mongo-backed
-replay on an existing archive. It indexes legacy manifests in place after
-checking the ordered chunks and SHA-256. The command can be rerun. It
-reads and updates MongoDB without starting listeners.
+### Signed updates for replay
+
+Set `CHAIN_ID` to the C1 chain ID and supply a shared secret of at least
+32 non-whitespace ASCII characters via `COMMITTED_DATA_PROXY_TOKEN`.
+This enables `GET /feeder_gateway/get_signed_committed_data_update` on
+port 8080 in either feeder mode. Send the token as `Authorization: Bearer`.
+
+- For a C1 publication, query with `root` and `transaction_hash`.
+- For a dependency, query with `root`, `application_id`, and `dataset_id`.
+
+The proxy selects one archived request using indexed keys and verifies its
+chunks and SHA-256. The response contains `root`, `entries`, `signatures`,
+and `update` when the operation is namespace-scoped. A missing lookup
+returns HTTP 404.
+
+Run the same binary with `CHAIN_ID` set and `--index-archive` before
+enabling replay against an existing archive. It adds the C1 transaction
+hash and dependency index fields to legacy manifests. The command can
+be rerun and does not start listeners or submit transactions.
+
+### Historical feeder data
 
 To serve historical roots from MongoDB, run the binary with
 `MONGO_FEEDER_ENABLED=true` and `--materialize-archive` before switching

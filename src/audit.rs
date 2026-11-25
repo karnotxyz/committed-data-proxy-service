@@ -1,4 +1,9 @@
-use crate::{datasets::DatasetStore, request};
+use crate::{
+    datasets::DatasetStore,
+    invoke_hash::invoke_hash,
+    request::{self, ArchivedRequest},
+    signed_updates::{version_key, Lookup},
+};
 use mongodb::{
     bson::{doc, oid::ObjectId, spec::BinarySubtype, Binary, Bson, DateTime, Document},
     options::{Acknowledgment, CollectionOptions, ReadConcern, WriteConcern},
@@ -6,7 +11,8 @@ use mongodb::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
+use starknet_types_core::felt::Felt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // MongoDB documents are limited to 16 MiB; keep every payload chunk well below it.
 const CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -55,6 +61,14 @@ impl Audit {
                     .build(),
             )
             .await?;
+        for keys in [
+            doc! {"c1_transaction_hash": 1, "dataset_roots": 1, "_id": -1},
+            doc! {"dataset_versions": 1, "_id": 1},
+        ] {
+            calls
+                .create_index(IndexModel::builder().keys(keys).build())
+                .await?;
+        }
         calls
             .create_index(
                 IndexModel::builder()
@@ -76,7 +90,7 @@ impl Audit {
         method: &str,
         rpc_id: &Value,
         request_body: &[u8],
-        dataset_roots: &[String],
+        mut index: Document,
     ) -> mongodb::error::Result<()> {
         let since_epoch = received_at.duration_since(UNIX_EPOCH).unwrap_or_default();
         let id = rpc_id.to_string();
@@ -92,8 +106,7 @@ impl Audit {
                 .await?;
         }
         // Publish the call only after all of its payload chunks are durable.
-        self.calls
-            .insert_one(doc! {
+        index.extend(doc! {
                 "_id": call_id,
                 "received_at": DateTime::from_millis(i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)),
                 "received_at_ns": i64::try_from(since_epoch.as_nanos()).unwrap_or(i64::MAX),
@@ -102,20 +115,28 @@ impl Audit {
                 "http_method": "POST",
                 "path": "/",
                 "content_type": "application/json",
-                "dataset_roots": dataset_roots.to_vec(),
                 "request_bytes": i64::try_from(request_body.len()).unwrap_or(i64::MAX),
                 "chunk_count": i32::try_from(request_body.len().div_ceil(CHUNK_BYTES)).unwrap_or(i32::MAX),
                 "payload_sha256": Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: payload_sha256 }),
-            })
-            .await?;
+        });
+        self.calls.insert_one(index).await?;
         Ok(())
     }
 
     /// Index legacy manifests in place. Request bytes and chunk documents are immutable.
-    pub async fn index_archive(&self) -> Result<u64, Box<dyn std::error::Error>> {
+    pub async fn index_archive(
+        &self,
+        chain_id: Option<Felt>,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let needs_index = if chain_id.is_some() {
+            "dataset_versions"
+        } else {
+            "dataset_roots"
+        };
+        let missing = doc! {needs_index: {"$exists": false}};
         let mut cursor = self
             .calls
-            .find(doc! {"dataset_roots": {"$exists": false}})
+            .find(missing.clone())
             .sort(doc! {"_id":1})
             .await?;
         let mut indexed = 0;
@@ -127,23 +148,52 @@ impl Audit {
                 .await
                 .map_err(|error| format!("Audit request {id}: {error}"))?;
             let call: Value = serde_json::from_slice(&payload)?;
-            let roots = if call["jsonrpc"] == "2.0" {
-                request::parse(&call)
-                    .map(|request| request.roots)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            let parsed = (call["jsonrpc"] == "2.0")
+                .then(|| request::parse(&call).ok())
+                .flatten();
+            let mut filter = missing.clone();
+            filter.insert("_id", id);
             let result = self
                 .calls
                 .update_one(
-                    doc! {"_id":id, "dataset_roots":{"$exists":false}},
-                    doc! {"$set":{"dataset_roots":roots}},
+                    filter,
+                    doc! {"$set":archive_index(parsed.as_ref(), chain_id)},
                 )
                 .await?;
             indexed += result.modified_count;
         }
         Ok(indexed)
+    }
+
+    pub async fn signed_dataset(
+        &self,
+        lookup: Lookup,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(payload) = tokio::time::timeout(Duration::from_secs(45), async {
+            let (key, order) = lookup.mongo_filter();
+            let Some(manifest) = self.calls.find_one(key).sort(doc! {"_id": order}).await? else {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(None);
+            };
+            self.read_payload(&manifest, manifest.get_object_id("_id")?)
+                .await
+                .map(Some)
+        })
+        .await??
+        else {
+            return Ok(None);
+        };
+        tokio::task::spawn_blocking(move || {
+            let call: Value = serde_json::from_slice(&payload)?;
+            let request = request::parse(&call)?;
+            let dataset = request
+                .datasets
+                .into_iter()
+                .find(|dataset| lookup.matches(dataset))
+                .ok_or("Dataset index does not match archived request")?;
+            let bytes = serde_json::to_vec(&dataset)?;
+            Ok(Some(bytes))
+        })
+        .await?
     }
 
     pub fn database(&self) -> &Database {
@@ -196,7 +246,7 @@ impl Audit {
         &self,
         manifest: &Document,
         id: ObjectId,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let size = usize::try_from(manifest.get_i64("request_bytes")?)?;
         let chunks = usize::try_from(manifest.get_i32("chunk_count")?)?;
         if size == 0 || size > MAX_REQUEST_BYTES || chunks != size.div_ceil(CHUNK_BYTES) {
@@ -224,4 +274,24 @@ impl Audit {
     pub async fn ready(&self) -> bool {
         self.database.run_command(doc! {"ping": 1}).await.is_ok()
     }
+}
+
+pub fn archive_index(parsed: Option<&ArchivedRequest<'_>>, chain_id: Option<Felt>) -> Document {
+    let roots = parsed
+        .map(|parsed| parsed.roots.as_slice())
+        .unwrap_or_default();
+    let mut index = doc! {"dataset_roots": roots.to_vec()};
+    if let Some(chain_id) = chain_id {
+        let versions: Vec<String> = parsed
+            .into_iter()
+            .flat_map(|parsed| &parsed.datasets)
+            .filter_map(version_key)
+            .collect();
+        let transaction = parsed
+            .and_then(|parsed| parsed.transaction)
+            .and_then(|transaction| invoke_hash(transaction, chain_id));
+        index.insert("dataset_versions", versions);
+        index.insert("c1_transaction_hash", transaction);
+    }
+    index
 }

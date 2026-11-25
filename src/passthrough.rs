@@ -1,9 +1,10 @@
 //! Archive committed-data ingress, submit root transactions to C1, and serve feeder reads.
 use crate::{
-    audit::{Audit, MAX_REQUEST_BYTES},
+    audit::{archive_index, Audit, MAX_REQUEST_BYTES},
     datasets::DatasetStore,
     mongo_feeder,
     request::{self, COMBINED, IMPORT, UPDATE},
+    signed_updates::{self, SignedUpdates},
 };
 use axum::{
     body::{Body, Bytes},
@@ -40,6 +41,7 @@ struct App {
     client: reqwest::Client,
     c1_url: Option<String>,
     feeder: Feeder,
+    signed_updates: Option<SignedUpdates>,
     forward_transactions: bool,
 }
 
@@ -159,7 +161,17 @@ async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
             .unwrap_or_default();
         if let Err(error) = app
             .audit
-            .record(call_id, received_at, method, &id, &body, roots)
+            .record(
+                call_id,
+                received_at,
+                method,
+                &id,
+                &body,
+                archive_index(
+                    parsed.as_ref().ok(),
+                    app.signed_updates.as_ref().map(|api| api.chain_id),
+                ),
+            )
             .await
         {
             eprintln!("request={request_id} MongoDB audit write failed: {error}");
@@ -252,6 +264,13 @@ async fn feeder(
     }
 }
 
+async fn signed_update(State(app): State<Arc<App>>, uri: Uri, headers: HeaderMap) -> Response {
+    match &app.signed_updates {
+        Some(api) => api.serve(app.audit.clone(), uri, headers).await,
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn write_ready(State(app): State<Arc<App>>) -> (StatusCode, &'static str) {
     match tokio::time::timeout(Duration::from_millis(800), app.audit.ready()).await {
         Ok(true) => (StatusCode::OK, "OK"),
@@ -293,6 +312,7 @@ pub async fn run(
             .build()?,
         c1_url: env::var("C1_RPC_URL").ok(),
         feeder: backend,
+        signed_updates: SignedUpdates::from_env()?,
         forward_transactions: env::var("FORWARD_TRANSACTIONS").as_deref() == Ok("true"),
     });
     if app.forward_transactions && app.c1_url.is_none() {
@@ -307,6 +327,7 @@ pub async fn run(
     let feeder = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/ready", get(feeder_ready))
+        .route(signed_updates::PATH, get(signed_update))
         .fallback(any(feeder))
         .layer(feeder_body_limit)
         .with_state(app.clone());

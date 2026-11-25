@@ -569,3 +569,139 @@ async fn mongo_feeder_materializes_updates_and_serves_them_after_restart() {
     task.abort();
     database.drop().await.unwrap();
 }
+
+#[tokio::test]
+async fn signed_replay_route_uses_the_transaction_and_namespace_indexes() {
+    let _ports = PROXY_PORTS.lock().await;
+    let uri = std::env::var("E2E_MONGO_URI").expect("set E2E_MONGO_URI");
+    let mongo = mongodb::Client::with_uri_str(&uri).await.unwrap();
+    let database_name = format!("proxy_signed_replay_{}", std::process::id());
+    let database = mongo.database(&database_name);
+    let calls = database.collection::<Document>("calls");
+    let c2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let c2_url = format!("http://{}", c2.local_addr().unwrap());
+    let c2_task = tokio::spawn(async move {
+        axum::serve(
+            c2,
+            Router::new().route("/health", axum::routing::get(|| async { "OK" })),
+        )
+        .await
+        .unwrap();
+    });
+    let token = "test-proxy-token-at-least-32-characters";
+    let command = || {
+        let mut bin = Command::new(env!("CARGO_BIN_EXE_committed-data-proxy-service"));
+        bin.env("MONGO_URI", &uri)
+            .env("MONGO_DATABASE", &database_name)
+            .env("MONGO_AUDIT_COLLECTION", "calls")
+            .env("CHAIN_ID", "0x1")
+            .env_remove("MONGO_FEEDER_ENABLED")
+            .env_remove("COMMITTED_DATA_PROXY_TOKEN")
+            .env("FORWARD_TRANSACTIONS", "false")
+            .env("C2_FEEDER_URL", &c2_url);
+        bin
+    };
+    let client = reqwest::Client::new();
+    let route = "http://127.0.0.1:8080/feeder_gateway/get_signed_committed_data_update";
+    let app =
+        |base: Option<&str>| json!({"application_id":"0x1","dataset_id":"0x2","base_root":base});
+    let base = json!({"root":"0x10","entries":[["0x1","0x2"]],"signatures":[],"update":app(None)});
+    let patch =
+        json!({"root":"0x20","entries":[["0x1","0x3"]],"signatures":[],"update":app(Some("0x10"))});
+    let unsafe_noop =
+        json!({"root":"0x10","entries":[],"signatures":[],"update":app(Some("0x10"))});
+    let invoke = |nonce: &str, datasets: Value| {
+        json!({
+            "jsonrpc":"2.0","id":1,"method":COMBINED,"params":{
+                "datasets":datasets,"transaction":{
+                    "type":"INVOKE","version":"0x3","sender_address":"0x4","calldata":["0x1","0x6"],
+                    "signature":[],"nonce":nonce,"tip":"0x0","resource_bounds":{
+                        "l1_gas":{"max_amount":"0x1","max_price_per_unit":"0x2"},
+                        "l2_gas":{"max_amount":"0x2","max_price_per_unit":"0x3"},
+                        "l1_data_gas":{"max_amount":"0x3","max_price_per_unit":"0x4"}
+                    },
+                    "paymaster_data":[],"account_deployment_data":[],
+                    "nonce_data_availability_mode":"L1","fee_data_availability_mode":"L1"
+                }
+            }
+        })
+    };
+    // Expected C1 transaction hashes from Starknet.js for these two INVOKEs.
+    let legacy_hash = "0x65d67a4f2984a301458c5caca09a52321943a2679e5e4bb29b6bf458671a5b3";
+    let new_hash = "0x860ff9a3173031807f283eb950e148bc63db68c2c5e387e2d81e02accbfd51";
+    let before = start_feeder_probe(&mut command(), &client).await;
+    let (response, _) = post_rpc(&client, invoke("0x1", json!([base, patch]))).await;
+    assert_eq!(response["error"]["code"], -32003);
+    assert_eq!(client.get(route).send().await.unwrap().status(), 404);
+    drop(before);
+    for expected in [1, 0] {
+        let index = command().arg("--index-archive").output().unwrap();
+        assert!(
+            index.status.success(),
+            "{}",
+            String::from_utf8_lossy(&index.stderr)
+        );
+        assert!(String::from_utf8_lossy(&index.stderr)
+            .contains(&format!("Indexed {expected} archived requests")));
+    }
+
+    let proxy =
+        start_feeder_probe(command().env("COMMITTED_DATA_PROXY_TOKEN", token), &client).await;
+    let (response, _) = post_rpc(&client, invoke("0x2", json!([unsafe_noop, patch]))).await;
+    assert_eq!(response["error"]["code"], -32003);
+    let lookup = |root: &str, hash: &str| format!("{route}?root={root}&transaction_hash={hash}");
+    let get = |url: String| client.get(url).bearer_auth(token);
+    for hash in [legacy_hash, new_hash] {
+        let body: Value = get(lookup("0x020", hash))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body, patch);
+    }
+    let query =
+        |application| format!("{route}?root=0x10&application_id={application}&dataset_id=0x2");
+    assert_eq!(client.get(query("0x1")).send().await.unwrap().status(), 401);
+    assert_eq!(get(query("0x3")).send().await.unwrap().status(), 404);
+    assert_eq!(
+        get(lookup("0x20", "0x123")).send().await.unwrap().status(),
+        404
+    );
+    assert_eq!(
+        get(format!("{route}?root=0x20"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    let indexed_base: Value = get(query("0x1"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(indexed_base, base);
+
+    calls
+        .update_one(
+            doc! {"c1_transaction_hash":new_hash},
+            doc! {"$set": {"request_bytes":1_i64}},
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        get(lookup("0x20", new_hash)).send().await.unwrap().status(),
+        503
+    );
+    drop(proxy);
+    c2_task.abort();
+    database.drop().await.unwrap();
+}

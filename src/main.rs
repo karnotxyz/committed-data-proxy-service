@@ -1,16 +1,25 @@
 mod audit;
 mod datasets;
+mod invoke_hash;
 mod mongo_feeder;
 mod passthrough;
 mod patricia;
 mod request;
+mod signed_updates;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audit = audit::Audit::from_env().await?;
     let command = std::env::args().nth(1);
     if command.as_deref() == Some("--index-archive") {
-        eprintln!("Indexed {} archived requests", audit.index_archive().await?);
+        let chain_id = std::env::var("CHAIN_ID")
+            .ok()
+            .map(|value| starknet_types_core::felt::Felt::from_hex(&value))
+            .transpose()?;
+        eprintln!(
+            "Indexed {} archived requests",
+            audit.index_archive(chain_id).await?
+        );
         return Ok(());
     }
     let store = datasets::DatasetStore::from_env(audit.database())?;

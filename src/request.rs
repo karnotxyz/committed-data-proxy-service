@@ -1,3 +1,4 @@
+use serde::Serialize;
 use serde_json::Value;
 
 pub const COMBINED: &str = "madara_V0_1_0_importCommittedDataAndSubmitTransaction";
@@ -10,10 +11,12 @@ pub struct ArchivedRequest<'a> {
     pub datasets: Vec<RawDataset<'a>>,
 }
 
+#[derive(Serialize)]
 pub struct RawDataset<'a> {
     pub root: &'a Value,
     pub entries: &'a Value,
     pub signatures: &'a Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub update: Option<&'a Value>,
 }
 
@@ -31,7 +34,7 @@ fn params<'a, const N: usize>(value: &'a Value, fields: [&str; N]) -> Option<[&'
     }
 }
 
-fn canonical_felt(value: &Value) -> Option<String> {
+pub fn canonical_felt(value: &Value) -> Option<String> {
     const MODULUS: &str = "800000000000011000000000000000000000000000000000000000000000001";
     let digits = value.as_str()?.strip_prefix("0x")?;
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
