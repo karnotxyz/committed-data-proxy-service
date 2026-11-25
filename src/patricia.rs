@@ -1,0 +1,256 @@
+//! Copied from madara-alliance/sequencer@1b51ef1e9d77a2405ce936005ebcf7910c51063d
+//! Standard Starknet Poseidon Patricia commitments: value leaves, binary hashes,
+//! and explicit compressed edges. Keys are restricted to 251 bits; zero means absence.
+use serde::Serialize;
+use starknet_types_core::felt::Felt;
+use starknet_types_core::hash::{Poseidon, StarkHash};
+
+/// The three import errors used by Madara's pinned Patricia implementation.
+#[derive(Debug, thiserror::Error)]
+pub enum CommittedDataError {
+    #[error("invalid committed-data length")]
+    InvalidLength,
+    #[error("invalid committed-data key or proof")]
+    InvalidWitness,
+    #[error("duplicate committed-data key")]
+    DuplicateKey,
+}
+
+/// Same key domain as the OS Patricia implementation.
+pub const COMMITTED_DATA_TREE_HEIGHT: usize = 251;
+/// Per-import allocation bound, independent of key width and total retained DB size.
+pub const MAX_COMMITTED_DATA_VALUES: usize = 524_288;
+
+/// Application-defined key and value. Neither has pricing semantics in the node.
+pub type CommittedDataEntry = (Felt, Felt);
+
+/// A bottom-up proof step. Bits must strictly increase, so skipped unary paths cost no nodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommittedDataSibling {
+    pub bit: u8,
+    pub hash: Felt,
+}
+
+/// A branch in the compact persistent representation. IDs below the entry count are leaves;
+/// other IDs address binary nodes in postorder. Hashes are at bit+1 height;
+/// the root or a parent may wrap them in a standard compressed edge.
+#[derive(Clone, Copy, Debug)]
+pub struct CommittedDataBranch {
+    pub bit: u8,
+    pub left: u32,
+    pub right: u32,
+    pub hash: Felt,
+}
+
+/// Authenticated lookup evidence for a single (root, key), independent of the reading contract.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommittedDataWitness {
+    /// Exact immutable dataset commitment.
+    pub root: Felt,
+    /// Requested key; unchanged for both lookup outcomes.
+    pub key: Felt,
+    /// Authenticated terminal leaf value; not a returned value when `terminal_key` is present.
+    pub value: Felt,
+    /// Terminal leaf key for an absent lookup. Omitted for membership, preserving its wire form.
+    /// Absence is authenticated only when this key differs and follows every requested branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_key: Option<Felt>,
+    pub siblings: Vec<CommittedDataSibling>,
+}
+
+/// Standard Patricia leaves contain the value directly.
+pub fn leaf(_key: Felt, value: Felt) -> Felt {
+    value
+}
+/// Standard binary node. The level is represented by the path, not a hash domain.
+pub fn branch(_bit: u8, left: Felt, right: Felt) -> Felt {
+    Poseidon::hash(&left, &right)
+}
+
+pub fn valid_key(key: Felt) -> bool {
+    key.to_bytes_be()[0] < 8
+}
+
+fn edge(hash: Felt, key: Felt, bottom: usize, top: usize) -> (Felt, Option<Vec<Felt>>) {
+    if bottom == top || hash == Felt::ZERO {
+        return (hash, None);
+    }
+    let length = top - bottom;
+    let mut path = Felt::ZERO;
+    for bit in (bottom..top).rev() {
+        path = path * Felt::TWO + Felt::from(key_bit(key, bit as u8) as u8);
+    }
+    (
+        Poseidon::hash(&hash, &path) + Felt::from(length),
+        Some(vec![Felt::from(length), path, hash]),
+    )
+}
+
+/// Tests a least-significant-bit-numbered position in a canonical felt.
+pub fn key_bit(key: Felt, bit: u8) -> bool {
+    let bytes = key.to_bytes_be();
+    bytes[31 - usize::from(bit) / 8] & (1 << (bit % 8)) != 0
+}
+
+/// Sorted nonzero entries and compact binary nodes. Edge commitments are derived
+/// from child heights and key prefixes, using the standard Starknet encoding.
+#[derive(Debug)]
+pub struct CommittedDataSet {
+    entries: Vec<CommittedDataEntry>,
+    branches: Vec<CommittedDataBranch>,
+    root: Felt,
+}
+impl CommittedDataSet {
+    /// Sorts keys and rejects duplicates. Input order never changes the root.
+    pub fn new(mut entries: Vec<CommittedDataEntry>) -> Result<Self, CommittedDataError> {
+        if entries.len() > MAX_COMMITTED_DATA_VALUES {
+            return Err(CommittedDataError::InvalidLength);
+        }
+        if entries.iter().any(|(key, _)| !valid_key(*key)) {
+            return Err(CommittedDataError::InvalidWitness);
+        }
+        entries.sort_unstable_by_key(|entry| entry.0);
+        if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(CommittedDataError::DuplicateKey);
+        }
+        entries.retain(|(_, value)| *value != Felt::ZERO);
+        let mut branches = Vec::with_capacity(entries.len().saturating_sub(1));
+        let root = if entries.is_empty() {
+            Felt::ZERO
+        } else {
+            let (_, hash) = build(&entries, 0, entries.len() as u32, &mut branches)?;
+            let height = branches.last().map_or(0, |node| usize::from(node.bit) + 1);
+            edge(hash, entries[0].0, height, COMMITTED_DATA_TREE_HEIGHT).0
+        };
+        Ok(Self {
+            entries,
+            branches,
+            root,
+        })
+    }
+    pub fn root(&self) -> Felt {
+        self.root
+    }
+    pub fn entries(&self) -> &[CommittedDataEntry] {
+        &self.entries
+    }
+    /// Follow the requested route even when its leaf is absent. The terminal leaf and siblings
+    /// authenticate either membership or non-membership without changing a stored commitment.
+    pub fn lookup_witness(&self, key: Felt) -> CommittedDataWitness {
+        if self.entries.is_empty() {
+            return CommittedDataWitness {
+                root: self.root,
+                key,
+                value: Felt::ZERO,
+                terminal_key: None,
+                siblings: vec![],
+            };
+        }
+        let count = self.entries.len();
+        let mut id = (count + self.branches.len() - 1) as u32;
+        let mut siblings = Vec::new();
+        while id as usize >= count {
+            let node = self.branches[id as usize - count];
+            let (child, sibling) = if key_bit(key, node.bit) {
+                (node.right, node.left)
+            } else {
+                (node.left, node.right)
+            };
+            let hash = if (sibling as usize) < count {
+                let entry = self.entries[sibling as usize];
+                leaf(entry.0, entry.1)
+            } else {
+                self.branches[sibling as usize - count].hash
+            };
+            let sibling_height = if (sibling as usize) < count {
+                0
+            } else {
+                usize::from(self.branches[sibling as usize - count].bit) + 1
+            };
+            // Recover one descendant key to encode the sibling's compressed edge.
+            let mut terminal_id = sibling as usize;
+            while terminal_id >= count {
+                terminal_id = self.branches[terminal_id - count].left as usize;
+            }
+            let hash = edge(
+                hash,
+                self.entries[terminal_id].0,
+                sibling_height,
+                usize::from(node.bit),
+            )
+            .0;
+            siblings.push(CommittedDataSibling {
+                bit: node.bit,
+                hash,
+            });
+            id = child;
+        }
+        siblings.reverse();
+        let (terminal, value) = self.entries[id as usize];
+        CommittedDataWitness {
+            root: self.root,
+            key,
+            value,
+            siblings,
+            terminal_key: (terminal != key).then_some(terminal),
+        }
+    }
+}
+
+fn build(
+    entries: &[CommittedDataEntry],
+    offset: u32,
+    count: u32,
+    branches: &mut Vec<CommittedDataBranch>,
+) -> Result<(u32, Felt), CommittedDataError> {
+    if entries.len() == 1 {
+        return Ok((offset, leaf(entries[0].0, entries[0].1)));
+    }
+    let first = entries[0].0.to_bytes_be();
+    let last = entries[entries.len() - 1].0.to_bytes_be();
+    // Keys are sorted and unique, so their first differing bit is the subtree's critical bit.
+    let bit = first
+        .iter()
+        .zip(last)
+        .enumerate()
+        .find_map(|(i, (&a, b))| {
+            let xor = a ^ b;
+            (xor != 0).then(|| ((31 - i) * 8 + 7 - xor.leading_zeros() as usize) as u8)
+        })
+        .ok_or(CommittedDataError::DuplicateKey)?;
+    let split = entries.partition_point(|entry| !key_bit(entry.0, bit));
+    let (left, left_hash) = build(&entries[..split], offset, count, branches)?;
+    let (right, right_hash) = build(&entries[split..], offset + split as u32, count, branches)?;
+    let child_height = |id: u32| {
+        if id < count {
+            0
+        } else {
+            usize::from(branches[(id - count) as usize].bit) + 1
+        }
+    };
+    let left_hash = edge(
+        left_hash,
+        entries[0].0,
+        child_height(left),
+        usize::from(bit),
+    )
+    .0;
+    let right_hash = edge(
+        right_hash,
+        entries[split].0,
+        child_height(right),
+        usize::from(bit),
+    )
+    .0;
+    let hash = branch(bit, left_hash, right_hash);
+    let id = count + branches.len() as u32;
+    branches.push(CommittedDataBranch {
+        bit,
+        left,
+        right,
+        hash,
+    });
+    Ok((id, hash))
+}

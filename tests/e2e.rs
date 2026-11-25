@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+static PROXY_PORTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const COMBINED: &str = "madara_V0_1_0_importCommittedDataAndSubmitTransaction";
 const IMPORT: &str = "madara_V0_1_0_importCommittedDataSet";
 const UPDATE: &str = "madara_V0_1_0_updateCommittedDataSet";
@@ -37,7 +39,8 @@ async fn post_rpc(client: &reqwest::Client, request: Value) -> (Value, Vec<u8>) 
 }
 
 #[tokio::test]
-async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
+async fn proxy_archives_before_c1_and_routes_only_feeder_reads_to_c2() {
+    let _ports = PROXY_PORTS.lock().await;
     let mongo_uri = std::env::var("E2E_MONGO_URI").expect("set E2E_MONGO_URI");
     let mongo = mongodb::Client::with_uri_str(&mongo_uri).await.unwrap();
     let database_name = format!("proxy_audit_e2e_{}", std::process::id());
@@ -50,7 +53,7 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
         axum::serve(
             c2_listener,
             Router::new()
-                .route("/ready", axum::routing::get(|| async { "OK" }))
+                .route("/health", axum::routing::get(|| async { "OK" }))
                 .route(
                     "/",
                     post(move |Json(request): Json<Value>| {
@@ -76,10 +79,15 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
     let c1_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let c1_url = format!("http://{}", c1_listener.local_addr().unwrap());
     let c1_calls = calls.clone();
+    let c1_archive = database.collection::<Document>("calls");
     let c1_task = tokio::spawn(async move {
         axum::serve(c1_listener, Router::new().route("/", post(move |Json(request): Json<Value>| {
             let calls = c1_calls.clone();
+            let archive = c1_archive.clone();
             async move {
+                let manifest = archive.find_one(doc! {"method":COMBINED, "dataset_roots":"0x2"}).await.unwrap();
+                assert!(manifest.is_some(), "C1 contacted before the root was indexed");
+                assert_eq!(request["params"], json!({"invoke_transaction":{"type":"INVOKE","nonce":"0x1"}}));
                 calls.lock().unwrap().push(("c1".into(), request["method"].as_str().unwrap().into()));
                 Json(json!({"jsonrpc":"2.0","id":request["id"],"result":{"transaction_hash":"0x123"}}))
             }
@@ -88,10 +96,9 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
     let proxy = Proxy(
         Command::new(env!("CARGO_BIN_EXE_committed-data-proxy-service"))
             .env("C1_RPC_URL", c1_url)
-            .env("C2_IMPORT_URL", &c2_url)
+            .env_remove("MONGO_FEEDER_ENABLED")
             .env("C2_FEEDER_URL", &c2_url)
             .env("FORWARD_TRANSACTIONS", "true")
-            .env("REQUIRE_C2_ACK_BEFORE_C1", "true")
             .env("MONGO_URI", &mongo_uri)
             .env("MONGO_DATABASE", &database_name)
             .env("MONGO_AUDIT_COLLECTION", "calls")
@@ -115,7 +122,17 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(ready, "proxy did not start without RocksDB");
+    assert!(
+        ready,
+        "proxy did not start without a C2 write URL or RocksDB"
+    );
+    assert!(client
+        .get("http://127.0.0.1:8080/ready")
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
     let standalone_body = format!(
         "{{ \"id\": 1, \"method\": \"{IMPORT}\", \"params\": [\"0x1\", [], []], \"jsonrpc\": \"2.0\" }}\n"
     )
@@ -150,7 +167,7 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
     let (combined, combined_body) = post_rpc(
         &client,
         json!({"jsonrpc":"2.0","id":2,"method":COMBINED,"params":{
-            "datasets":[{"root":"0x1","entries":[],"signatures":[]}],
+            "datasets":[{"root":"0x0002","entries":[],"signatures":[]},{"root":"0x3","entries":[],"signatures":[]}],
             "transaction":{"type":"INVOKE","nonce":"0x1"}}}),
     )
     .await;
@@ -165,16 +182,48 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
     assert!(large_body.len() > 16 * 1024 * 1024);
     assert_eq!(
         calls.lock().unwrap().as_slice(),
-        &[
-            ("c2".into(), IMPORT.into()),
-            ("c2".into(), UPDATE.into()),
-            ("c2".into(), IMPORT.into()),
-            ("c1".into(), "starknet_addInvokeTransaction".into()),
-            ("c2".into(), IMPORT.into()),
-        ]
+        &[("c1".into(), "starknet_addInvokeTransaction".into())]
     );
     let collection = database.collection::<Document>("calls");
     let chunks = database.collection::<Document>("calls_chunks");
+    let combined_manifest = collection
+        .find_one(doc! {"method":COMBINED})
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        combined_manifest.get_array("dataset_roots").unwrap(),
+        &vec!["0x2".into(), "0x3".into()]
+    );
+    let combined_id = combined_manifest.get_object_id("_id").unwrap();
+    collection
+        .update_one(
+            doc! {"_id":combined_id},
+            doc! {"$unset":{"dataset_roots":""}},
+        )
+        .await
+        .unwrap();
+    // Old proxy images did not include dataset_roots on their audit manifests.
+    for expected in ["Indexed 1 archived requests", "Indexed 0 archived requests"] {
+        let result = Command::new(env!("CARGO_BIN_EXE_committed-data-proxy-service"))
+            .arg("--index-archive")
+            .env("MONGO_URI", &mongo_uri)
+            .env("MONGO_DATABASE", &database_name)
+            .env("MONGO_AUDIT_COLLECTION", "calls")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains(expected));
+    }
+    assert!(collection
+        .find_one(doc! {"_id":combined_id, "dataset_roots":"0x2"})
+        .await
+        .unwrap()
+        .is_some());
     assert_eq!(collection.count_documents(doc! {}).await.unwrap(), 4);
     let mut cursor = collection
         .find(doc! {})
@@ -207,8 +256,452 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
         methods.push(entry.get_str("method").unwrap().to_owned());
     }
     assert_eq!(methods, [IMPORT, UPDATE, COMBINED, IMPORT]);
+    // A valid request may not reach C1 if MongoDB rejects its manifest.
+    database
+        .run_command(doc! {
+            "collMod":"calls",
+            "validator":{"dataset_roots":{"$ne":"0x2"}},
+        })
+        .await
+        .unwrap();
+    let (failed, _) = post_rpc(
+        &client,
+        json!({
+            "jsonrpc":"2.0","id":5,"method":COMBINED,"params":[
+                [{"root":"0x2","entries":[],"signatures":[]}],
+                {"type":"INVOKE","nonce":"0x1"}]
+        }),
+    )
+    .await;
+    assert_eq!(failed["error"]["code"], -32007);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+
     drop(proxy);
     database.drop().await.unwrap();
     c1_task.abort();
     c2_task.abort();
+}
+
+#[path = "../src/patricia.rs"]
+mod patricia;
+use starknet_core::{crypto::ecdsa_sign, utils::starknet_keccak};
+use starknet_types_core::{curve::AffinePoint, felt::Felt};
+
+fn signed_dataset(root: Felt, entries: Value, update: Option<Value>) -> Value {
+    let mut bytes = if update.is_some() {
+        b"MADARA_COMMITTED_DATA_UPDATE_V1".to_vec()
+    } else {
+        b"MADARA_COMMITTED_DATA_IMPORT_V1".to_vec()
+    };
+    bytes.extend(Felt::ONE.to_bytes_be());
+    if let Some(update) = &update {
+        for name in ["application_id", "dataset_id"] {
+            bytes.extend(
+                Felt::from_hex(update[name].as_str().unwrap())
+                    .unwrap()
+                    .to_bytes_be(),
+            );
+        }
+        let base = update["base_root"]
+            .as_str()
+            .map(|v| Felt::from_hex(v).unwrap());
+        bytes.push(u8::from(base.is_some()));
+        bytes.extend(base.unwrap_or(Felt::ZERO).to_bytes_be());
+    }
+    bytes.extend(root.to_bytes_be());
+    bytes.extend((entries.as_array().unwrap().len() as u32).to_be_bytes());
+    let signature = ecdsa_sign(&Felt::ONE, &starknet_keccak(&bytes)).unwrap();
+    json!({
+        "root":root, "update":update, "entries":entries,
+        "signatures":[{"public_key":AffinePoint::generator().x(), "r":signature.r, "s":signature.s}]
+    })
+}
+
+async fn start_feeder_probe(command: &mut Command, client: &reqwest::Client) -> Proxy {
+    let proxy = Proxy(
+        command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    for _ in 0..100 {
+        if client
+            .get("http://127.0.0.1:8080/ready")
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            return proxy;
+        }
+        tokio::time::sleep(Duration::from_millis(75)).await;
+    }
+    panic!("feeder did not become ready");
+}
+
+async fn feeder_get(client: &reqwest::Client, query: &str) -> Value {
+    client
+        .get(format!("http://127.0.0.1:8080/feeder_gateway/{query}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn mongo_feeder_materializes_updates_and_serves_them_after_restart() {
+    let _ports = PROXY_PORTS.lock().await;
+    let uri = std::env::var("E2E_MONGO_URI").expect("set E2E_MONGO_URI");
+    let mongo = mongodb::Client::with_uri_str(&uri).await.unwrap();
+    let database_name = format!("proxy_mongo_feeder_{}", std::process::id());
+    let database = mongo.database(&database_name);
+    let datasets = database.collection::<Document>("committed_data_datasets");
+    let manifests = database.collection::<Document>("calls");
+    let client = reqwest::Client::new();
+
+    let base_tree = patricia::CommittedDataSet::new(
+        (1..=4097)
+            .map(|index| (Felt::from(index as u64), Felt::ONE))
+            .collect(),
+    )
+    .unwrap();
+    let update_tree = patricia::CommittedDataSet::new(
+        base_tree
+            .entries()
+            .iter()
+            .map(|(key, value)| {
+                (
+                    *key,
+                    if *key == Felt::from(4097u64) {
+                        Felt::TWO
+                    } else {
+                        *value
+                    },
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let base = base_tree.root();
+    let root = update_tree.root();
+    let namespace =
+        |base: Option<Felt>| json!({"application_id":"0x1", "dataset_id":"0x2", "base_root":base});
+    let init = signed_dataset(base, json!(base_tree.entries()), Some(namespace(None)));
+    let patch = signed_dataset(
+        root,
+        json!([[Felt::from(4097u64), Felt::TWO]]),
+        Some(namespace(Some(base))),
+    );
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_url = format!("http://{}", upstream.local_addr().unwrap());
+    let archived = manifests.clone();
+    let materialized = datasets.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(upstream, Router::new()
+            .route("/health", axum::routing::get(|| async { "OK" }))
+            .route("/", post(move |Json(call): Json<Value>| {
+                let archived = archived.clone();
+                let materialized = materialized.clone();
+                async move {
+                    assert_eq!(call["method"], "starknet_addInvokeTransaction");
+                    assert!(archived.find_one(doc! {"method":COMBINED, "dataset_roots":format!("{root:#x}")}).await.unwrap().is_some());
+                    assert!(materialized.find_one(doc! {"_id":format!("root/{}", hex::encode(root.to_bytes_be()))}).await.unwrap().is_some());
+                    Json(json!({"jsonrpc":"2.0","id":call["id"],"result":{"transaction_hash":"0xabc"}}))
+                }
+            }))).await.unwrap();
+    });
+
+    let command = || {
+        let mut bin = Command::new(env!("CARGO_BIN_EXE_committed-data-proxy-service"));
+        bin.env("MONGO_URI", &uri)
+            .env("MONGO_DATABASE", &database_name)
+            .env("MONGO_AUDIT_COLLECTION", "calls")
+            .env("CHAIN_ID", "0x1")
+            .env(
+                "COMMITTED_DATA_SIGNERS",
+                format!("{:#x}", AffinePoint::generator().x()),
+            )
+            .env("FORWARD_TRANSACTIONS", "true")
+            .env("C1_RPC_URL", &upstream_url)
+            .env_remove("C2_FEEDER_URL")
+            .env_remove("C2_IMPORT_URL")
+            .env("MONGO_FEEDER_ENABLED", "true");
+        bin
+    };
+
+    let previous = start_feeder_probe(
+        command()
+            .env("MONGO_FEEDER_ENABLED", "false")
+            .env("C2_FEEDER_URL", &upstream_url),
+        &client,
+    )
+    .await;
+    let (standalone, _) = post_rpc(
+        &client,
+        json!({"jsonrpc":"2.0","id":10,"method":UPDATE,
+        "params":[init["update"], init["root"], init["entries"], init["signatures"]]}),
+    )
+    .await;
+    assert_eq!(standalone.get("result"), Some(&Value::Null));
+    assert_eq!(datasets.count_documents(doc! {}).await.unwrap(), 0);
+    drop(previous);
+
+    for expected in [
+        "Materialized 1 archived datasets",
+        "Materialized 0 archived datasets",
+    ] {
+        let result = command().arg("--materialize-archive").output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains(expected));
+    }
+    let proxy = start_feeder_probe(&mut command(), &client).await;
+    let (result, _) = post_rpc(
+        &client,
+        json!({"jsonrpc":"2.0","id":11,"method":COMBINED,
+        "params":[[patch], {"type":"INVOKE","nonce":"0x2"}]}),
+    )
+    .await;
+    assert_eq!(result["result"]["transaction_hash"], "0xabc");
+
+    let mut roots = vec![base, root];
+    roots.sort();
+    assert_eq!(
+        feeder_get(&client, "get_committed_data_roots").await,
+        json!(roots)
+    );
+    assert_eq!(
+        feeder_get(
+            &client,
+            &format!("get_committed_data_roots?after={:#x}", roots[0])
+        )
+        .await,
+        json!([roots[1]]),
+    );
+    let versions = feeder_get(&client, "get_committed_data_versions").await;
+    assert_eq!(versions.as_array().unwrap().len(), 2);
+    assert_eq!(
+        versions[0],
+        json!({"application_id":"0x1","dataset_id":"0x2","root":roots[0]})
+    );
+    assert_eq!(
+        feeder_get(
+            &client,
+            &format!(
+                "get_committed_data_versions?application_id=0x1&dataset_id=0x2&root={:#x}",
+                roots[0]
+            )
+        )
+        .await,
+        json!([versions[1]]),
+    );
+    let range = doc! {"_id":{"$gt":"page/","$lt":"page/~"}};
+    assert_eq!(
+        datasets.count_documents(range).await.unwrap(),
+        3,
+        "unchanged first page is shared"
+    );
+
+    let mut unauthorized = patch.clone();
+    unauthorized["signatures"] = json!([]);
+    let (rejected, _) = post_rpc(
+        &client,
+        json!({"jsonrpc":"2.0","id":12,"method":COMBINED,
+        "params":[[unauthorized], {"type":"INVOKE","nonce":"0x3"}]}),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], -32005);
+    assert!(manifests
+        .find_one(doc! {"rpc_id":"12"})
+        .await
+        .unwrap()
+        .is_some());
+
+    drop(proxy);
+    let proxy = start_feeder_probe(&mut command(), &client).await;
+    let page = feeder_get(
+        &client,
+        &format!("get_committed_data?root={root:#x}&start=4096"),
+    )
+    .await;
+    assert_eq!(
+        page,
+        json!({"root":root,"count":4097,"start":4096,"entries":[["0x1001","0x2"]]})
+    );
+    let witness = feeder_get(
+        &client,
+        &format!("get_committed_data_witness?root={root:#x}&key=0x1001"),
+    )
+    .await;
+    assert_eq!(
+        witness,
+        json!(update_tree.lookup_witness(Felt::from(4097u64)))
+    );
+    let batch = feeder_get(
+        &client,
+        &format!("get_committed_data_witnesses?root={root:#x}&keys=0x1001,0x1002"),
+    )
+    .await;
+    let post: Value = client
+        .post("http://127.0.0.1:8080/feeder_gateway/get_committed_data_witnesses")
+        .json(&json!({"root":root,"keys":["0x1001","0x1002"]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(batch, post);
+    assert_eq!(batch[0], witness);
+    assert!(batch[1]["terminal_key"].is_string());
+
+    drop(proxy);
+    task.abort();
+    database.drop().await.unwrap();
+}
+
+#[tokio::test]
+async fn signed_replay_route_uses_the_transaction_and_namespace_indexes() {
+    let _ports = PROXY_PORTS.lock().await;
+    let uri = std::env::var("E2E_MONGO_URI").expect("set E2E_MONGO_URI");
+    let mongo = mongodb::Client::with_uri_str(&uri).await.unwrap();
+    let database_name = format!("proxy_signed_replay_{}", std::process::id());
+    let database = mongo.database(&database_name);
+    let calls = database.collection::<Document>("calls");
+    let c2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let c2_url = format!("http://{}", c2.local_addr().unwrap());
+    let c2_task = tokio::spawn(async move {
+        axum::serve(
+            c2,
+            Router::new().route("/health", axum::routing::get(|| async { "OK" })),
+        )
+        .await
+        .unwrap();
+    });
+    let token = "test-proxy-token-at-least-32-characters";
+    let command = || {
+        let mut bin = Command::new(env!("CARGO_BIN_EXE_committed-data-proxy-service"));
+        bin.env("MONGO_URI", &uri)
+            .env("MONGO_DATABASE", &database_name)
+            .env("MONGO_AUDIT_COLLECTION", "calls")
+            .env("CHAIN_ID", "0x1")
+            .env_remove("MONGO_FEEDER_ENABLED")
+            .env_remove("COMMITTED_DATA_PROXY_TOKEN")
+            .env("FORWARD_TRANSACTIONS", "false")
+            .env("C2_FEEDER_URL", &c2_url);
+        bin
+    };
+    let client = reqwest::Client::new();
+    let route = "http://127.0.0.1:8080/feeder_gateway/get_signed_committed_data_update";
+    let app =
+        |base: Option<&str>| json!({"application_id":"0x1","dataset_id":"0x2","base_root":base});
+    let base = json!({"root":"0x10","entries":[["0x1","0x2"]],"signatures":[],"update":app(None)});
+    let patch =
+        json!({"root":"0x20","entries":[["0x1","0x3"]],"signatures":[],"update":app(Some("0x10"))});
+    let unsafe_noop =
+        json!({"root":"0x10","entries":[],"signatures":[],"update":app(Some("0x10"))});
+    let invoke = |nonce: &str, datasets: Value| {
+        json!({
+            "jsonrpc":"2.0","id":1,"method":COMBINED,"params":{
+                "datasets":datasets,"transaction":{
+                    "type":"INVOKE","version":"0x3","sender_address":"0x4","calldata":["0x1","0x6"],
+                    "signature":[],"nonce":nonce,"tip":"0x0","resource_bounds":{
+                        "l1_gas":{"max_amount":"0x1","max_price_per_unit":"0x2"},
+                        "l2_gas":{"max_amount":"0x2","max_price_per_unit":"0x3"},
+                        "l1_data_gas":{"max_amount":"0x3","max_price_per_unit":"0x4"}
+                    },
+                    "paymaster_data":[],"account_deployment_data":[],
+                    "nonce_data_availability_mode":"L1","fee_data_availability_mode":"L1"
+                }
+            }
+        })
+    };
+    // Expected C1 transaction hashes from Starknet.js for these two INVOKEs.
+    let legacy_hash = "0x65d67a4f2984a301458c5caca09a52321943a2679e5e4bb29b6bf458671a5b3";
+    let new_hash = "0x860ff9a3173031807f283eb950e148bc63db68c2c5e387e2d81e02accbfd51";
+    let before = start_feeder_probe(&mut command(), &client).await;
+    let (response, _) = post_rpc(&client, invoke("0x1", json!([base, patch]))).await;
+    assert_eq!(response["error"]["code"], -32003);
+    assert_eq!(client.get(route).send().await.unwrap().status(), 404);
+    drop(before);
+    for expected in [1, 0] {
+        let index = command().arg("--index-archive").output().unwrap();
+        assert!(
+            index.status.success(),
+            "{}",
+            String::from_utf8_lossy(&index.stderr)
+        );
+        assert!(String::from_utf8_lossy(&index.stderr)
+            .contains(&format!("Indexed {expected} archived requests")));
+    }
+
+    let proxy =
+        start_feeder_probe(command().env("COMMITTED_DATA_PROXY_TOKEN", token), &client).await;
+    let (response, _) = post_rpc(&client, invoke("0x2", json!([unsafe_noop, patch]))).await;
+    assert_eq!(response["error"]["code"], -32003);
+    let lookup = |root: &str, hash: &str| format!("{route}?root={root}&transaction_hash={hash}");
+    let get = |url: String| client.get(url).bearer_auth(token);
+    for hash in [legacy_hash, new_hash] {
+        let body: Value = get(lookup("0x020", hash))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body, patch);
+    }
+    let query =
+        |application| format!("{route}?root=0x10&application_id={application}&dataset_id=0x2");
+    assert_eq!(client.get(query("0x1")).send().await.unwrap().status(), 401);
+    assert_eq!(get(query("0x3")).send().await.unwrap().status(), 404);
+    assert_eq!(
+        get(lookup("0x20", "0x123")).send().await.unwrap().status(),
+        404
+    );
+    assert_eq!(
+        get(format!("{route}?root=0x20"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    let indexed_base: Value = get(query("0x1"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(indexed_base, base);
+
+    calls
+        .update_one(
+            doc! {"c1_transaction_hash":new_hash},
+            doc! {"$set": {"request_bytes":1_i64}},
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        get(lookup("0x20", new_hash)).send().await.unwrap().status(),
+        503
+    );
+    drop(proxy);
+    c2_task.abort();
+    database.drop().await.unwrap();
 }
