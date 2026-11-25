@@ -1,47 +1,41 @@
 # Committed data proxy service
 
-Stateless ingress for Paradex committed data. C2 Madara validates and stores the
-datasets in its own RocksDB and exports them to its MongoDB. This proxy has no
-local dataset database or archive. The proxy uses MongoDB only for an ingress
-audit record of each committed-data RPC call.
+Port 9945 accepts Paradex's committed-data JSON-RPC requests at `POST /`.
+For `madara_V0_1_0_importCommittedDataAndSubmitTransaction`, the proxy first
+archives the signed dataset payloads and the signed INVOKE in MongoDB. Once
+the archive is durable, the original signed INVOKE goes to C1 through
+`starknet_addInvokeTransaction`. The result contains C1's transaction hash.
+Standalone `madara_V0_1_0_importCommittedDataSet` and
+`madara_V0_1_0_updateCommittedDataSet` acknowledge archival with a null
+result. C2 validates and imports datasets later through the replay service.
 
-- Port 9945 serves `GET /health`, `GET /ready`, and JSON-RPC `POST /`.
-  `madara_V0_1_0_importCommittedDataSet` and
-  `madara_V0_1_0_updateCommittedDataSet` relay their request and response to C2.
-- For `madara_V0_1_0_importCommittedDataAndSubmitTransaction`, the proxy sends
-  each dataset to C2 through its import/update RPC. With
-  `REQUIRE_C2_ACK_BEFORE_C1=true` (default), C1 submission waits until every
-  dataset is acknowledged. With `false`, delivery continues in memory while
-  the signed INVOKE goes to C1 immediately. C2 gets the INVOKE later through
-  block replay; the proxy does not send it to C2.
-- Port 8080 sends every request except local `/health` and `/ready` to C2's
-  feeder gateway and returns C2's status, headers, and body.
+Port 8080 relays feeder requests and responses to C2. Both ports expose a
+local `/health` probe. The 9945 `/ready` checks MongoDB and the 8080 `/ready`
+checks the C2 feeder.
 
-Configure `C2_IMPORT_URL` (C2 port 9945), `C2_FEEDER_URL` (C2 port 8080),
-`C1_RPC_URL`, `FORWARD_TRANSACTIONS`, `REQUIRE_C2_ACK_BEFORE_C1`, and the required
-`MONGO_URI`. `MONGO_DATABASE` defaults to `committed_data`, and
-`MONGO_AUDIT_COLLECTION` defaults to `proxy_rpc_calls`. Every call to one of the
-three 9945 committed-data methods gets a majority/journal acknowledged MongoDB
-record with UTC receive time, nanosecond Unix time, method, JSON-RPC ID, request
-size, and SHA-256 of the exact incoming JSON body. The complete request body is
-stored in ordered 4 MiB binary documents in `<collection>_chunks`, avoiding
-MongoDB's 16 MiB document limit. The call record is inserted only after every
-chunk is durable. To replay, sort call records by `received_at_ns` and `_id`,
-concatenate chunks named `<call _id>:0` through `<call _id>:<chunk_count-1>`,
-verify `payload_sha256`, then POST the reconstructed bytes to the stored
-`path` (`/`) using the stored `content_type` (`application/json`). If the audit
-write fails, the call fails before reaching C1 or C2. Combined calls return an
-error while transaction forwarding is disabled. `/ready` checks C2 and MongoDB;
-`/health` is local.
+## Configuration and archive
 
-Forwarded requests retry transient transport failures, HTTP 408/429, and HTTP
-5xx up to five times with 1, 2, 4, 8, and 16 second delays. JSON-RPC
-application errors and other HTTP 4xx responses do not retry.
+Set `MONGO_URI`, `C2_FEEDER_URL` (C2 port 8080), and `C1_RPC_URL` when
+`FORWARD_TRANSACTIONS=true`. With forwarding disabled, recognized calls
+are still archived and combined calls return a forwarding-disabled error.
 
-There is no proxy admission journal or global request ordering. If C1 accepts a
-transaction but its response is lost, retries may submit the same signed
-transaction again. The caller must reconcile the transaction. With C2
-acknowledgment disabled, delivery can be lost if the proxy restarts.
+`MONGO_DATABASE` defaults to `committed_data`. `MONGO_AUDIT_COLLECTION`
+defaults to `proxy_rpc_calls`. Requests are stored as exact JSON bytes in
+ordered 4 MiB binary chunks in `<collection>_chunks`. After all chunks are
+durable, the proxy inserts the manifest with method, receive time, byte
+count, chunk count, SHA-256, and an indexed `dataset_roots` array of
+canonical hexadecimal roots. Writes use majority and journal
+acknowledgment. An audit failure prevents C1 submission.
 
-`cargo test` runs unit and process-level HTTP and MongoDB audit tests. The manually triggered
-GitHub Actions workflow builds and publishes the public GHCR image.
+Run the same binary with `--index-archive` before enabling Mongo-backed
+replay on an existing archive. It indexes legacy manifests in place after
+checking the ordered chunks and SHA-256. The command can be rerun. It
+reads and updates MongoDB without starting listeners.
+
+Forwarded requests retry transient transport errors and HTTP 408, 429 or
+5xx responses. A caller that loses a C1 response should reconcile the
+original signed transaction on C1.
+
+Run `E2E_MONGO_URI=mongodb://127.0.0.1:27017 cargo test` with a disposable
+MongoDB instance. The manually triggered GitHub Actions workflow publishes
+the GHCR image.

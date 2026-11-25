@@ -37,7 +37,7 @@ async fn post_rpc(client: &reqwest::Client, request: Value) -> (Value, Vec<u8>) 
 }
 
 #[tokio::test]
-async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
+async fn proxy_archives_before_c1_and_routes_only_feeder_reads_to_c2() {
     let mongo_uri = std::env::var("E2E_MONGO_URI").expect("set E2E_MONGO_URI");
     let mongo = mongodb::Client::with_uri_str(&mongo_uri).await.unwrap();
     let database_name = format!("proxy_audit_e2e_{}", std::process::id());
@@ -50,7 +50,7 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
         axum::serve(
             c2_listener,
             Router::new()
-                .route("/ready", axum::routing::get(|| async { "OK" }))
+                .route("/health", axum::routing::get(|| async { "OK" }))
                 .route(
                     "/",
                     post(move |Json(request): Json<Value>| {
@@ -76,10 +76,15 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
     let c1_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let c1_url = format!("http://{}", c1_listener.local_addr().unwrap());
     let c1_calls = calls.clone();
+    let c1_archive = database.collection::<Document>("calls");
     let c1_task = tokio::spawn(async move {
         axum::serve(c1_listener, Router::new().route("/", post(move |Json(request): Json<Value>| {
             let calls = c1_calls.clone();
+            let archive = c1_archive.clone();
             async move {
+                let manifest = archive.find_one(doc! {"method":COMBINED, "dataset_roots":"0x2"}).await.unwrap();
+                assert!(manifest.is_some(), "C1 contacted before the root was indexed");
+                assert_eq!(request["params"], json!({"invoke_transaction":{"type":"INVOKE","nonce":"0x1"}}));
                 calls.lock().unwrap().push(("c1".into(), request["method"].as_str().unwrap().into()));
                 Json(json!({"jsonrpc":"2.0","id":request["id"],"result":{"transaction_hash":"0x123"}}))
             }
@@ -88,10 +93,8 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
     let proxy = Proxy(
         Command::new(env!("CARGO_BIN_EXE_committed-data-proxy-service"))
             .env("C1_RPC_URL", c1_url)
-            .env("C2_IMPORT_URL", &c2_url)
             .env("C2_FEEDER_URL", &c2_url)
             .env("FORWARD_TRANSACTIONS", "true")
-            .env("REQUIRE_C2_ACK_BEFORE_C1", "true")
             .env("MONGO_URI", &mongo_uri)
             .env("MONGO_DATABASE", &database_name)
             .env("MONGO_AUDIT_COLLECTION", "calls")
@@ -115,7 +118,17 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(ready, "proxy did not start without RocksDB");
+    assert!(
+        ready,
+        "proxy did not start without a C2 write URL or RocksDB"
+    );
+    assert!(client
+        .get("http://127.0.0.1:8080/ready")
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
     let standalone_body = format!(
         "{{ \"id\": 1, \"method\": \"{IMPORT}\", \"params\": [\"0x1\", [], []], \"jsonrpc\": \"2.0\" }}\n"
     )
@@ -150,7 +163,7 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
     let (combined, combined_body) = post_rpc(
         &client,
         json!({"jsonrpc":"2.0","id":2,"method":COMBINED,"params":{
-            "datasets":[{"root":"0x1","entries":[],"signatures":[]}],
+            "datasets":[{"root":"0x0002","entries":[],"signatures":[]},{"root":"0x3","entries":[],"signatures":[]}],
             "transaction":{"type":"INVOKE","nonce":"0x1"}}}),
     )
     .await;
@@ -165,16 +178,48 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
     assert!(large_body.len() > 16 * 1024 * 1024);
     assert_eq!(
         calls.lock().unwrap().as_slice(),
-        &[
-            ("c2".into(), IMPORT.into()),
-            ("c2".into(), UPDATE.into()),
-            ("c2".into(), IMPORT.into()),
-            ("c1".into(), "starknet_addInvokeTransaction".into()),
-            ("c2".into(), IMPORT.into()),
-        ]
+        &[("c1".into(), "starknet_addInvokeTransaction".into())]
     );
     let collection = database.collection::<Document>("calls");
     let chunks = database.collection::<Document>("calls_chunks");
+    let combined_manifest = collection
+        .find_one(doc! {"method":COMBINED})
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        combined_manifest.get_array("dataset_roots").unwrap(),
+        &vec!["0x2".into(), "0x3".into()]
+    );
+    let combined_id = combined_manifest.get_object_id("_id").unwrap();
+    collection
+        .update_one(
+            doc! {"_id":combined_id},
+            doc! {"$unset":{"dataset_roots":""}},
+        )
+        .await
+        .unwrap();
+    // Old proxy images did not include dataset_roots on their audit manifests.
+    for expected in ["Indexed 1 archived requests", "Indexed 0 archived requests"] {
+        let result = Command::new(env!("CARGO_BIN_EXE_committed-data-proxy-service"))
+            .arg("--index-archive")
+            .env("MONGO_URI", &mongo_uri)
+            .env("MONGO_DATABASE", &database_name)
+            .env("MONGO_AUDIT_COLLECTION", "calls")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains(expected));
+    }
+    assert!(collection
+        .find_one(doc! {"_id":combined_id, "dataset_roots":"0x2"})
+        .await
+        .unwrap()
+        .is_some());
     assert_eq!(collection.count_documents(doc! {}).await.unwrap(), 4);
     let mut cursor = collection
         .find(doc! {})
@@ -207,6 +252,26 @@ async fn stateless_proxy_routes_dataset_reads_and_root_transaction() {
         methods.push(entry.get_str("method").unwrap().to_owned());
     }
     assert_eq!(methods, [IMPORT, UPDATE, COMBINED, IMPORT]);
+    // A valid request may not reach C1 if MongoDB rejects its manifest.
+    database
+        .run_command(doc! {
+            "collMod":"calls",
+            "validator":{"dataset_roots":{"$ne":"0x2"}},
+        })
+        .await
+        .unwrap();
+    let (failed, _) = post_rpc(
+        &client,
+        json!({
+            "jsonrpc":"2.0","id":5,"method":COMBINED,"params":[
+                [{"root":"0x2","entries":[],"signatures":[]}],
+                {"type":"INVOKE","nonce":"0x1"}]
+        }),
+    )
+    .await;
+    assert_eq!(failed["error"]["code"], -32007);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+
     drop(proxy);
     database.drop().await.unwrap();
     c1_task.abort();
