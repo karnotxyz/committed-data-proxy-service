@@ -11,7 +11,7 @@ pub struct ArchivedRequest<'a> {
     pub datasets: Vec<RawDataset<'a>>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 pub struct RawDataset<'a> {
     pub root: &'a Value,
     pub entries: &'a Value,

@@ -1,6 +1,7 @@
 use crate::{
     patricia::{valid_key, CommittedDataSet, CommittedDataWitness, MAX_COMMITTED_DATA_VALUES},
     request::RawDataset,
+    retry::{insert_if_absent, BoxError, MAJORITY_WRITE_TIMEOUT},
 };
 use mongodb::{
     bson::{doc, spec::BinarySubtype, Binary, Document},
@@ -211,6 +212,7 @@ impl DatasetStore {
                 WriteConcern::builder()
                     .w(Acknowledgment::Majority)
                     .journal(true)
+                    .w_timeout(MAJORITY_WRITE_TIMEOUT)
                     .build(),
             )
             .build();
@@ -223,27 +225,19 @@ impl DatasetStore {
         }))
     }
 
-    async fn get(&self, id: &str) -> Result<Option<Document>, String> {
-        self.documents
-            .find_one(doc! {"_id": id})
-            .await
-            .map_err(error_text)
+    async fn get(&self, id: &str) -> mongodb::error::Result<Option<Document>> {
+        self.documents.find_one(doc! {"_id": id}).await
     }
 
-    async fn insert_if_absent(&self, id: &str, document: Document) -> Result<(), String> {
-        self.documents
-            .update_one(doc! {"_id": id}, doc! {"$setOnInsert": document})
-            .upsert(true)
-            .await
-            .map_err(error_text)?;
-        Ok(())
+    async fn insert_if_absent(&self, id: &str, document: Document) -> Result<(), BoxError> {
+        insert_if_absent(&self.documents, id, document).await
     }
 
-    async fn snapshot(&self, root: Felt) -> Result<Option<Snapshot>, String> {
+    async fn snapshot(&self, root: Felt) -> Result<Option<Snapshot>, BoxError> {
         let Some(document) = self.get(&root_id(root)).await? else {
             return Ok(None);
         };
-        let snapshot: Snapshot = mongodb::bson::from_document(document).map_err(error_text)?;
+        let snapshot: Snapshot = mongodb::bson::from_document(document)?;
         if snapshot.count > MAX_COMMITTED_DATA_VALUES
             || snapshot.pages.len() != snapshot.count.div_ceil(VALUES_PER_PAGE)
             || (snapshot.count == 0) != (root == Felt::ZERO)
@@ -256,7 +250,7 @@ impl DatasetStore {
     async fn tree(
         &self,
         root: Felt,
-    ) -> Result<Option<(Arc<Snapshot>, Arc<CommittedDataSet>)>, String> {
+    ) -> Result<Option<(Arc<Snapshot>, Arc<CommittedDataSet>)>, BoxError> {
         if let Some(cached) = self
             .hot
             .lock()
@@ -272,10 +266,9 @@ impl DatasetStore {
         let mut cursor = self
             .documents
             .find(doc! {"_id": {"$in": &snapshot.pages}})
-            .await
-            .map_err(error_text)?;
+            .await?;
         let mut compressed = HashMap::new();
-        while cursor.advance().await.map_err(error_text)? {
+        while cursor.advance().await? {
             let document = cursor.deserialize_current().map_err(error_text)?;
             compressed.insert(
                 document.get_str("_id").map_err(error_text)?.to_owned(),
@@ -316,7 +309,7 @@ impl DatasetStore {
     }
 
     /// A backfill can skip a dataset only once its materialized root and any namespace label exist.
-    pub async fn contains(&self, input: &RawDataset<'_>) -> Result<bool, String> {
+    pub async fn contains(&self, input: &RawDataset<'_>) -> Result<bool, BoxError> {
         let root = Felt::deserialize(input.root).map_err(error_text)?;
         if let Some(update) = input
             .update
@@ -335,7 +328,7 @@ impl DatasetStore {
         Ok(self.get(&root_id(root)).await?.is_some())
     }
 
-    pub async fn put(&self, raw: RawDataset<'_>) -> Result<(), String> {
+    pub async fn put(&self, raw: RawDataset<'_>) -> Result<(), BoxError> {
         let _writer = self.write.lock().await;
         let dataset = Dataset::decode(raw)?;
         let root = dataset.root;
@@ -511,7 +504,7 @@ impl DatasetStore {
     }
 
     pub async fn page(&self, root: Felt, start: usize) -> Result<Value, String> {
-        let Some(snapshot) = self.snapshot(root).await? else {
+        let Some(snapshot) = self.snapshot(root).await.map_err(error_text)? else {
             return Ok(Value::Null);
         };
         if snapshot.count == 0 && start == 0 {
@@ -521,7 +514,11 @@ impl DatasetStore {
             .pages
             .get(start / VALUES_PER_PAGE)
             .ok_or("Committed-data page outside dataset")?;
-        let document = self.get(id).await?.ok_or("Missing stored dataset page")?;
+        let document = self
+            .get(id)
+            .await
+            .map_err(error_text)?
+            .ok_or("Missing stored dataset page")?;
         let values = document.get_binary_generic("values").map_err(error_text)?;
         let entries = decode_page(id, values, VALUES_PER_PAGE.min(snapshot.count - start))?;
         Ok(json!({"root":root, "start":start, "count":snapshot.count,"entries":entries}))
@@ -532,7 +529,7 @@ impl DatasetStore {
         root: Felt,
         keys: Vec<Felt>,
     ) -> Result<Option<Vec<CommittedDataWitness>>, String> {
-        let Some((_, tree)) = self.tree(root).await? else {
+        let Some((_, tree)) = self.tree(root).await.map_err(error_text)? else {
             return Ok(None);
         };
         tokio::task::spawn_blocking(move || {

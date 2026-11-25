@@ -2,6 +2,7 @@ use crate::{
     datasets::DatasetStore,
     invoke_hash::invoke_hash,
     request::{self, ArchivedRequest},
+    retry::{insert_if_absent, BoxError, MAJORITY_WRITE_TIMEOUT},
     signed_updates::{version_key, Lookup},
 };
 use mongodb::{
@@ -48,6 +49,7 @@ impl Audit {
                 WriteConcern::builder()
                     .w(Acknowledgment::Majority)
                     .journal(true)
+                    .w_timeout(MAJORITY_WRITE_TIMEOUT)
                     .build(),
             )
             .build();
@@ -90,24 +92,25 @@ impl Audit {
         method: &str,
         rpc_id: &Value,
         request_body: &[u8],
-        mut index: Document,
-    ) -> mongodb::error::Result<()> {
+        index: &Document,
+    ) -> Result<(), BoxError> {
         let since_epoch = received_at.duration_since(UNIX_EPOCH).unwrap_or_default();
         let id = rpc_id.to_string();
         let payload_sha256 = Sha256::digest(request_body).to_vec();
         for (index, bytes) in request_body.chunks(CHUNK_BYTES).enumerate() {
-            self.chunks
-                .insert_one(doc! {
-                    "_id": format!("{}:{index}", call_id.to_hex()),
+            insert_if_absent(
+                &self.chunks,
+                format!("{}:{index}", call_id.to_hex()),
+                doc! {
                     "call_id": call_id,
                     "index": i32::try_from(index).unwrap_or(i32::MAX),
                     "payload": Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: bytes.to_vec() }),
-                })
-                .await?;
+                },
+            ).await?;
         }
         // Publish the call only after all of its payload chunks are durable.
-        index.extend(doc! {
-                "_id": call_id,
+        let mut manifest = index.clone();
+        manifest.extend(doc! {
                 "received_at": DateTime::from_millis(i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)),
                 "received_at_ns": i64::try_from(since_epoch.as_nanos()).unwrap_or(i64::MAX),
                 "method": method,
@@ -119,8 +122,7 @@ impl Audit {
                 "chunk_count": i32::try_from(request_body.len().div_ceil(CHUNK_BYTES)).unwrap_or(i32::MAX),
                 "payload_sha256": Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: payload_sha256 }),
         });
-        self.calls.insert_one(index).await?;
-        Ok(())
+        insert_if_absent(&self.calls, call_id, manifest).await
     }
 
     /// Index legacy manifests in place. Request bytes and chunk documents are immutable.
@@ -294,4 +296,50 @@ pub fn archive_index(parsed: Option<&ArchivedRequest<'_>>, chain_id: Option<Felt
         index.insert("c1_transaction_hash", transaction);
     }
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retry_resumes_an_archive_after_a_partial_write() {
+        let uri = std::env::var("E2E_MONGO_URI").expect("set E2E_MONGO_URI");
+        let name = format!("proxy_partial_archive_{}", std::process::id());
+        let audit = Audit::connect(&uri, &name, "calls").await.unwrap();
+        let id = ObjectId::new();
+        let received = SystemTime::now();
+        let body = vec![42; CHUNK_BYTES + 7];
+        let index = doc! {"dataset_roots": ["0x1"]};
+        audit.chunks.insert_one(doc! {
+            "_id": format!("{id}:0"),
+            "call_id": id,
+            "index": 0,
+            "payload": Binary {subtype: BinarySubtype::Generic, bytes: body[..CHUNK_BYTES].to_vec()}
+        }).await.unwrap();
+
+        for _ in 0..2 {
+            audit
+                .record(id, received, request::IMPORT, &Value::Null, &body, &index)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            audit
+                .chunks
+                .count_documents(doc! {"call_id":id})
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(audit.calls.count_documents(doc! {}).await.unwrap(), 1);
+        let manifest = audit
+            .calls
+            .find_one(doc! {"_id":id})
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(audit.read_payload(&manifest, id).await.unwrap(), body);
+        audit.database.drop().await.unwrap();
+    }
 }

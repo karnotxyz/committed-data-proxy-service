@@ -5,6 +5,7 @@ mod mongo_feeder;
 mod passthrough;
 mod patricia;
 mod request;
+mod retry;
 mod signed_updates;
 
 #[tokio::main]

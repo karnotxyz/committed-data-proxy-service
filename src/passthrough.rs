@@ -4,6 +4,7 @@ use crate::{
     datasets::DatasetStore,
     mongo_feeder,
     request::{self, COMBINED, IMPORT, UPDATE},
+    retry::{mongo_write, RETRY_DELAYS},
     signed_updates::{self, SignedUpdates},
 };
 use axum::{
@@ -44,14 +45,6 @@ struct App {
     signed_updates: Option<SignedUpdates>,
     forward_transactions: bool,
 }
-
-const RETRY_DELAYS: [Duration; 5] = [
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(4),
-    Duration::from_secs(8),
-    Duration::from_secs(16),
-];
 
 struct Upstream {
     status: StatusCode,
@@ -159,20 +152,15 @@ async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
             .as_ref()
             .map(|request| request.roots.as_slice())
             .unwrap_or_default();
-        if let Err(error) = app
-            .audit
-            .record(
-                call_id,
-                received_at,
-                method,
-                &id,
-                &body,
-                archive_index(
-                    parsed.as_ref().ok(),
-                    app.signed_updates.as_ref().map(|api| api.chain_id),
-                ),
-            )
-            .await
+        let index = archive_index(
+            parsed.as_ref().ok(),
+            app.signed_updates.as_ref().map(|api| api.chain_id),
+        );
+        if let Err(error) = mongo_write(&request_id, "archive", || {
+            app.audit
+                .record(call_id, received_at, method, &id, &body, &index)
+        })
+        .await
         {
             eprintln!("request={request_id} MongoDB audit write failed: {error}");
             return rpc_error(id, -32007, "Audit log unavailable").into_response();
@@ -196,9 +184,9 @@ async fn rpc(State(app): State<Arc<App>>, body: Bytes) -> Response {
     if let Feeder::Mongo(store, _) = &app.feeder {
         let dataset_count = request.datasets.len();
         for dataset in request.datasets {
-            if let Err(error) = store.put(dataset).await {
+            if let Err(error) = mongo_write(&request_id, "dataset", || store.put(dataset)).await {
                 eprintln!("request={request_id} MongoDB dataset import failed: {error}");
-                return rpc_error(id, -32005, &error).into_response();
+                return rpc_error(id, -32005, &error.to_string()).into_response();
             }
         }
         eprintln!("request={request_id} MongoDB materialized datasets={dataset_count}");

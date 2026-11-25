@@ -37,6 +37,12 @@ count, chunk count, SHA-256, and an indexed `dataset_roots` array of
 canonical hexadecimal roots. Writes use majority and journal
 acknowledgment. An audit failure prevents C1 submission.
 
+The proxy retries transient MongoDB failures up to five times during
+request archival and dataset materialization, with delays of 1, 2, 4, 8,
+and 16 seconds. Retries reuse the original request and dataset keys.
+Validation failures return immediately. The proxy requires acknowledgement
+of both stages before forwarding the INVOKE to C1.
+
 The local feeder stores root and version records and shared data pages in
 `committed_data_datasets`. Indexed lookups serve the root and version
 lists and retrieve individual data pages. Witnesses use the standard
