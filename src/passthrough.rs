@@ -57,7 +57,7 @@ fn retryable(status: StatusCode) -> bool {
 }
 
 async fn send_with_retry(request: reqwest::RequestBuilder) -> Result<Upstream, String> {
-    for attempt in 0..=RETRY_DELAYS.len() {
+    for (attempt, delay) in RETRY_DELAYS.into_iter().map(Some).chain([None]).enumerate() {
         let current = request
             .try_clone()
             .ok_or("Request body cannot be retried")?;
@@ -66,7 +66,7 @@ async fn send_with_retry(request: reqwest::RequestBuilder) -> Result<Upstream, S
                 let status = response.status();
                 let headers = response.headers().clone();
                 match response.bytes().await {
-                    Ok(body) if !retryable(status) || attempt == RETRY_DELAYS.len() => {
+                    Ok(body) if !retryable(status) || delay.is_none() => {
                         return Ok(Upstream {
                             status,
                             headers,
@@ -79,11 +79,11 @@ async fn send_with_retry(request: reqwest::RequestBuilder) -> Result<Upstream, S
             }
             Err(error) => error.to_string(),
         };
-        if attempt == RETRY_DELAYS.len() {
+        let Some(delay) = delay else {
             return Err(failure);
-        }
+        };
         eprintln!("upstream request retry {}: {failure}", attempt + 1);
-        tokio::time::sleep(RETRY_DELAYS[attempt]).await;
+        tokio::time::sleep(delay).await;
     }
     unreachable!()
 }

@@ -84,7 +84,7 @@ impl Audit {
             self.chunks
                 .insert_one(doc! {
                     "_id": format!("{}:{index}", call_id.to_hex()),
-                    "call_id": call_id.clone(),
+                    "call_id": call_id,
                     "index": i32::try_from(index).unwrap_or(i32::MAX),
                     "payload": Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: bytes.to_vec() }),
                 })
